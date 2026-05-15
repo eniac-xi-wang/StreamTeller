@@ -9,6 +9,7 @@ class PredictMemConfig:
     window_frames: int = 16
     target_frames: int = 2
     temporal_stride: int = 2
+    fps: float = 1.0
     jepa_size: int = 256
     qwen_size: int = 512
     patch_size: int = 16

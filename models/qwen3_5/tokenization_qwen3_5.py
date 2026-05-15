@@ -16,8 +16,8 @@
 from tokenizers import Regex, Tokenizer, decoders, normalizers, pre_tokenizers
 from tokenizers.models import BPE
 
-from ...tokenization_utils_tokenizers import TokenizersBackend
-from ...utils import logging
+from transformers.tokenization_utils_tokenizers import TokenizersBackend
+from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)

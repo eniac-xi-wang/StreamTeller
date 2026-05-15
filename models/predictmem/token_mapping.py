@@ -3,10 +3,11 @@
 V-JEPA scores are produced on a fixed 16-frame 256px grid:
     8 temporal tubelets x 16 x 16 = 2048 tokens.
 
-Qwen video token counts depend on the actual processor output. Qwen3.5 with
-``video_grid_thw=[8,32,32]`` has the same 8 x 16 x 16 LLM-token grid, while
-Qwen3-VL with ``video_grid_thw=[2,32,32]`` has a 2 x 16 x 16 grid and needs
-temporal aggregation from four V-JEPA tubelets into one Qwen token.
+Qwen video token counts depend on the actual processor output. With the project
+default 1FPS, 16-frame, 512px input, Qwen3.5 should produce
+``video_grid_thw=[8,32,32]`` and the same 8 x 16 x 16 LLM-token grid. If a
+processor returns fewer temporal tokens, this module aggregates JEPA scores to
+that grid instead of silently applying mismatched keep indices.
 """
 
 from __future__ import annotations
@@ -100,9 +101,10 @@ class TokenMapper:
     def assert_video_grid_thw(self, video_grid_thw: torch.Tensor, expected_t: int | None = None):
         """Validate Qwen processor ``video_grid_thw``.
 
-        Both Qwen3.5 ``[8,32,32]`` and Qwen3-VL ``[2,32,32]`` are valid for this
-        project. Spatial dimensions must still match the configured 512px Qwen
-        input grid and be divisible by the Qwen merge size.
+        The main Qwen3.5 path expects ``[8,32,32]`` for a 16-frame 512px window.
+        Other temporal lengths are allowed so smoke tests fail gracefully when a
+        processor resamples unexpectedly. Spatial dimensions must still match
+        the configured 512px Qwen input grid and be divisible by the merge size.
         """
         if video_grid_thw is None:
             raise ValueError("video_grid_thw is required for dynamic JEPA->Qwen mapping")

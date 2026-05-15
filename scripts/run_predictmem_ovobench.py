@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Run OVO-Bench evaluation with PredictMem token pruning.
+"""Real Qwen3.5 evaluator for PredictMem on OVO-Bench.
 
-Supports: baseline, random, uniform, predictmem.
+Loads Qwen3.5-9B, samples videos at 1FPS with decord, and runs all four
+methods (baseline, random, uniform, predictmem) with real model.generate().
 
 Usage:
     python scripts/run_predictmem_ovobench.py \
-        --method predictmem \
-        --cache_path results/predictmem_scores.jsonl \
+        --model_path /data/model_weights_public/Qwen/Qwen3.5-9B \
+        --cache_path results/predictmem_scores_1fps_5.jsonl \
         --max_samples 5 --device cuda
 """
 
@@ -17,75 +18,72 @@ import time
 from pathlib import Path
 
 import torch
-import numpy as np
 
-_models_dir = Path(__file__).parent.parent / "models"
-if str(_models_dir) not in sys.path:
-    sys.path.insert(0, str(_models_dir))
+_repo_root = Path(__file__).parent.parent
+_models_dir = _repo_root / "models"
+for _path in (_repo_root, _models_dir):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 from predictmem.config import PredictMemConfig
 from predictmem.token_mapping import TokenMapper
 from predictmem.cache import ScoreCache
+from predictmem.video_sampling import sample_video_1fps_decord
 
 
-# ─── Results logger ───────────────────────────────────────────────────────────
+def load_qwen35_model(model_path: str, device: str):
+    from models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
-class EvalLogger:
-    REQUIRED_FIELDS = [
-        "sample_id", "video", "question", "ground_truth", "prediction",
-        "method", "keep_ratio_target", "keep_ratio_actual",
-        "original_video_tokens", "kept_video_tokens",
-        "score_latency_s", "vision_latency_s",
-        "prefill_latency_s", "decode_latency_s", "total_latency_s",
-        "peak_memory_mb",
-    ]
-
-    def __init__(self, output_path: str):
-        self.output_path = Path(output_path)
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.results = []
-
-    def log(self, entry: dict):
-        for field in self.REQUIRED_FIELDS:
-            entry.setdefault(field, None)
-        self.results.append(entry)
-
-    def flush(self):
-        with open(self.output_path, "w") as f:
-            for r in self.results:
-                f.write(json.dumps(r) + "\n")
+    return Qwen3_5ForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto" if device == "cuda" else device,
+    )
 
 
-# ─── Sample loader ────────────────────────────────────────────────────────────
+def load_qwen35_processor(model_path: str, fps: float):
+    from transformers import AutoProcessor, AutoTokenizer
 
-def load_ovo_samples(bench_path: str, max_samples: int, video_base: str) -> list[dict]:
-    """Load OVO-Bench samples, mapping video names to chunked video paths."""
-    with open(bench_path) as f:
-        data = json.load(f)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    except Exception:
+        from models.qwen3_5.processing_qwen3_vl import Qwen3_5Processor
+        from models.qwen3_5.video_processing_qwen3_vl import Qwen3_5VideoProcessor
 
-    samples = []
-    for item in data[:max_samples]:
-        vid_name = Path(item["video"]).stem
-        samples.append({
-            "sample_id": str(item["id"]),
-            "video": str(Path(video_base) / f"{item['id']}.mp4"),
-            "question": item["question"],
-            "ground_truth": item["answer"],
-            "options": item.get("options", []),
-            "gt_idx": item.get("gt"),
-        })
-    return samples
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        try:
+            video_processor = Qwen3_5VideoProcessor.from_pretrained(model_path, fps=fps)
+        except Exception:
+            video_processor = Qwen3_5VideoProcessor(fps=fps)
+        processor = Qwen3_5Processor(
+            image_processor=None,
+            tokenizer=tokenizer,
+            video_processor=video_processor,
+            chat_template=getattr(tokenizer, "chat_template", None),
+        )
+
+    if hasattr(processor, "video_processor"):
+        processor.video_processor.fps = fps
+        processor.video_processor.do_resize = False
+    return processor
 
 
-# ─── Keep-index generators per method ─────────────────────────────────────────
+def move_inputs_to_device(inputs: dict, device: str) -> dict:
+    return {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
 
-def generate_keep_indices(method: str, config: PredictMemConfig, sample_id: str,
-                          cache: ScoreCache | None = None, seed: int = 0,
-                          video_grid_thw: torch.Tensor | None = None) -> tuple[list, dict]:
+
+def decode_new_tokens(processor, generated_ids: torch.Tensor, input_len: int) -> str:
+    output_ids = generated_ids[0, input_len:]
+    if hasattr(processor, "decode"):
+        return processor.decode(output_ids, skip_special_tokens=True)
+    return processor.tokenizer.decode(output_ids, skip_special_tokens=True)
+
+
+def generate_keep_indices_for_method(method: str, config: PredictMemConfig,
+                                      sample_id: str, cache: ScoreCache | None,
+                                      seed: int, video_grid_thw: torch.Tensor,
+                                      mapper: TokenMapper) -> tuple[list, dict]:
     """Generate keep_indices for one sample. Returns (keep_indices_list, stats_dict)."""
-    mapper = TokenMapper(config)
-    if video_grid_thw is None:
-        video_grid_thw = torch.tensor([[config.qwen_grid_t, config.qwen_grid_h, config.qwen_grid_w]])
     num_tokens = mapper.compute_num_video_tokens(video_grid_thw)
     stats = {"original_video_tokens": num_tokens}
 
@@ -105,7 +103,6 @@ def generate_keep_indices(method: str, config: PredictMemConfig, sample_id: str,
     elif method == "uniform":
         n_keep = max(1, int(num_tokens * config.keep_ratio))
         step = num_tokens / n_keep
-        indices = torch.arange(num_tokens, dtype=torch.float)
         keep_local = torch.round(torch.arange(n_keep).float() * step).long()
         keep_local = keep_local.clamp(0, num_tokens - 1).unique()
         keep = [keep_local.sort().values]
@@ -134,27 +131,165 @@ def generate_keep_indices(method: str, config: PredictMemConfig, sample_id: str,
     return keep, stats
 
 
-# ─── Main eval loop ───────────────────────────────────────────────────────────
+def load_ovo_samples(bench_path: str, max_samples: int, video_base: str) -> list[dict]:
+    with open(bench_path) as f:
+        data = json.load(f)
+
+    samples = []
+    for item in data[:max_samples]:
+        samples.append({
+            "sample_id": str(item["id"]),
+            "video": str(Path(video_base) / f"{item['id']}.mp4"),
+            "question": item["question"],
+            "ground_truth": item["answer"],
+            "options": item.get("options", []),
+            "gt_idx": item.get("gt"),
+        })
+    return samples
+
+
+def run_one_sample(model, processor, sample: dict, method: str, config: PredictMemConfig,
+                   cache: ScoreCache | None, seed: int, device: str,
+                   mapper: TokenMapper, args) -> dict:
+    """Run a single sample with real Qwen3.5 generate."""
+    sample_id = sample["sample_id"]
+
+    # Sample frames
+    video_sample = sample_video_1fps_decord(
+        sample["video"],
+        num_frames=config.window_frames,
+        size=config.qwen_size,
+        target_fps=config.fps,
+    )
+    frames_np = video_sample.frames_uint8
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": frames_np, "fps": config.fps},
+                {"type": "text", "text": sample["question"]},
+            ],
+        }
+    ]
+
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(
+        text=[text],
+        videos=[frames_np],
+        video_metadata=[video_sample.qwen_metadata()],
+        do_sample_frames=False,
+        do_resize=False,
+        fps=config.fps,
+        return_tensors="pt",
+    )
+    inputs = move_inputs_to_device(inputs, device)
+
+    video_grid_thw = inputs["video_grid_thw"].detach().cpu()
+    num_qwen_video_tokens = mapper.compute_num_video_tokens(video_grid_thw)
+
+    # Generate keep indices for this method
+    keep_indices, stats = generate_keep_indices_for_method(
+        method=method, config=config, sample_id=sample_id,
+        cache=cache, seed=seed, video_grid_thw=video_grid_thw, mapper=mapper,
+    )
+
+    # Run generation
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+
+    generate_kwargs = {}
+    if method != "baseline":
+        generate_kwargs["use_predictmem"] = True
+        generate_kwargs["predictmem_keep_indices"] = keep_indices
+    else:
+        generate_kwargs["use_predictmem"] = False
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            **generate_kwargs,
+        )
+
+    t1 = time.perf_counter()
+    total_latency = t1 - t0
+    output_text = decode_new_tokens(processor, generated_ids, inputs["input_ids"].shape[1])
+
+    if device == "cuda":
+        peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    else:
+        peak_memory = 0.0
+
+    kept = keep_indices[0].shape[0] if keep_indices else num_qwen_video_tokens
+
+    return {
+        "sample_id": sample_id,
+        "video": sample["video"],
+        "question": sample["question"],
+        "ground_truth": sample["ground_truth"],
+        "prediction": output_text,
+        "method": method,
+        "fps": config.fps,
+        "num_frames": config.window_frames,
+        "qwen_size": config.qwen_size,
+        "source_fps": video_sample.source_fps,
+        "source_indices": video_sample.source_indices,
+        "video_grid_thw": video_grid_thw.tolist(),
+        "keep_ratio_target": config.keep_ratio,
+        "keep_ratio_actual": stats["keep_ratio_actual"],
+        "original_video_tokens": stats["original_video_tokens"],
+        "kept_video_tokens": stats["kept_video_tokens"],
+        "score_latency_s": 0.0,
+        "vision_latency_s": 0.0,
+        "prefill_latency_s": round(total_latency, 4),
+        "decode_latency_s": 0.0,
+        "total_latency_s": round(total_latency, 4),
+        "peak_memory_mb": round(peak_memory, 1),
+    }
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", required=True, choices=["baseline", "random", "uniform", "predictmem"])
+    parser.add_argument("--model_path", required=True,
+                        default="/data/model_weights_public/Qwen/Qwen3.5-9B")
+    parser.add_argument("--method", required=True,
+                        choices=["baseline", "random", "uniform", "predictmem"])
     parser.add_argument("--cache_path", default="results/predictmem_scores.jsonl")
     parser.add_argument("--bench_path", default="evaluate/ovobench/ovo_bench_new.json")
     parser.add_argument("--video_dir", default="/data/qinian_workspace/OVO-Bench/chunked_videos")
-    parser.add_argument("--output", default="results/eval_output.jsonl")
+    parser.add_argument("--output", default="results/real_eval.jsonl")
     parser.add_argument("--max_samples", type=int, default=5)
     parser.add_argument("--keep_ratio", type=float, default=0.5)
-    parser.add_argument("--qwen_grid_t", type=int, default=8)
-    parser.add_argument("--qwen_grid_h", type=int, default=32)
-    parser.add_argument("--qwen_grid_w", type=int, default=32)
+    parser.add_argument("--fps", type=float, default=1.0)
+    parser.add_argument("--num_frames", type=int, default=16)
+    parser.add_argument("--qwen_size", type=int, default=512)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_new_tokens", type=int, default=50)
+    parser.add_argument("--allow_dynamic_grid", action="store_true")
     args = parser.parse_args()
 
     config = PredictMemConfig()
     config.keep_ratio = args.keep_ratio
-    video_grid_thw = torch.tensor([[args.qwen_grid_t, args.qwen_grid_h, args.qwen_grid_w]])
+    config.fps = args.fps
+    config.window_frames = args.num_frames
+    config.qwen_size = args.qwen_size
+    config.__post_init__()
+
+    # Load model
+    print(f"Loading Qwen3.5 from {args.model_path}...")
+    model = load_qwen35_model(args.model_path, args.device)
+    model.eval()
+    processor = load_qwen35_processor(args.model_path, args.fps)
+    n_params = sum(p.numel() for p in model.parameters()) / 1e9
+    print(f"  Loaded: {n_params:.1f}B params, video_token_id={model.config.video_token_id}")
+
+    mapper = TokenMapper(config)
 
     # Load cache for predictmem method
     cache = None
@@ -167,41 +302,60 @@ def main():
 
     # Load samples
     samples = load_ovo_samples(args.bench_path, args.max_samples, args.video_dir)
-    print(f"Loaded {len(samples)} samples, method={args.method}")
+    print(f"Running {len(samples)} samples, method={args.method}")
 
-    logger = EvalLogger(args.output)
-    torch.manual_seed(args.seed)
-
+    # Run evaluation
+    results = []
     for i, sample in enumerate(samples):
-        print(f"\n[{i+1}/{len(samples)}] {sample['sample_id']}")
+        sid = sample["sample_id"]
+        print(f"\n[{i+1}/{len(samples)}] sample_id={sid} method={args.method}")
 
-        keep_indices_list, stats = generate_keep_indices(
-            method=args.method, config=config, sample_id=sample["sample_id"],
-            cache=cache, seed=args.seed + i, video_grid_thw=video_grid_thw,
-        )
+        seed = args.seed + i
+        try:
+            entry = run_one_sample(
+                model=model, processor=processor, sample=sample,
+                method=args.method, config=config, cache=cache,
+                seed=seed, device=args.device, mapper=mapper, args=args,
+            )
+            results.append(entry)
+            print(f"  Prediction: {entry['prediction'][:120]}")
+            print(f"  Kept: {entry['kept_video_tokens']}/{entry['original_video_tokens']} "
+                  f"({entry['keep_ratio_actual']:.1%})")
+            print(f"  Latency: {entry['total_latency_s']:.3f}s, Peak mem: {entry['peak_memory_mb']:.0f}MB")
+            print(f"  Grid: {entry['video_grid_thw']}")
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            results.append({
+                "sample_id": sid,
+                "video": sample["video"],
+                "question": sample["question"],
+                "ground_truth": sample["ground_truth"],
+                "prediction": f"[error: {str(e)[:100]}]",
+                "method": args.method,
+                "fps": config.fps,
+                "num_frames": config.window_frames,
+                "video_grid_thw": [[config.qwen_grid_t, config.qwen_grid_h, config.qwen_grid_w]],
+                "keep_ratio_target": config.keep_ratio,
+                "keep_ratio_actual": 0.0,
+                "original_video_tokens": config.num_qwen_video_tokens,
+                "kept_video_tokens": 0,
+                "score_latency_s": 0.0,
+                "vision_latency_s": 0.0,
+                "prefill_latency_s": 0.0,
+                "decode_latency_s": 0.0,
+                "total_latency_s": 0.0,
+                "peak_memory_mb": 0.0,
+            })
 
-        entry = {
-            "sample_id": sample["sample_id"],
-            "video": sample["video"],
-            "question": sample["question"],
-            "ground_truth": sample["ground_truth"],
-            "prediction": f"[simulated_{args.method}]",
-            "method": args.method,
-            "keep_ratio_target": config.keep_ratio,
-            "keep_ratio_actual": stats["keep_ratio_actual"],
-            "original_video_tokens": stats["original_video_tokens"],
-            "kept_video_tokens": stats["kept_video_tokens"],
-            "score_latency_s": 0.0,
-            "vision_latency_s": 0.0,
-            "prefill_latency_s": 0.0,
-            "decode_latency_s": 0.0,
-            "total_latency_s": 0.0,
-            "peak_memory_mb": 0.0,
-        }
-        logger.log(entry)
-
-    logger.flush()
-    print(f"\nDone. Results: {args.output}")
+    # Write output
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        for r in results:
+            f.write(json.dumps(r) + "\n")
+    print(f"\nResults written to {args.output} ({len(results)} entries)")
 
 
 if __name__ == "__main__":

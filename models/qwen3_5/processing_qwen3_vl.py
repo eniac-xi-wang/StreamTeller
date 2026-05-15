@@ -20,12 +20,12 @@
 
 import numpy as np
 
-from ...feature_extraction_utils import BatchFeature
-from ...image_utils import ImageInput
-from ...processing_utils import MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
-from ...tokenization_utils_base import PreTokenizedInput, TextInput
-from ...utils import auto_docstring, logging
-from ...video_utils import VideoInput
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_utils import ImageInput
+from transformers.processing_utils import MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
+from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.utils import auto_docstring, logging
+from transformers.video_utils import VideoInput
 
 
 logger = logging.get_logger(__name__)
@@ -142,11 +142,11 @@ class Qwen3VLProcessor(ProcessorMixin):
                     metadata = video_metadata[index]
                     if metadata.fps is None:
                         logger.warning_once(
-                            "Qwen3VL requires frame timestamps to construct prompts, but the `fps` of the input video could not be inferred. "
+                            "Qwen3.5 requires frame timestamps to construct prompts, but the `fps` of the input video could not be inferred. "
                             "Probably `video_metadata` was missing from inputs and you passed pre-sampled frames. "
-                            "Defaulting to `fps=24`. Please provide `video_metadata` for more accurate results."
+                            "Defaulting to `fps=1`. Please provide `video_metadata` for more accurate results."
                         )
-                        metadata.fps = 24 if metadata.fps is None else metadata.fps
+                        metadata.fps = 1 if metadata.fps is None else metadata.fps
 
                     # if timestamps are not provided, calculate them
                     curr_timestamp = self._calculate_timestamps(
@@ -212,6 +212,7 @@ class Qwen3VLProcessor(ProcessorMixin):
         if video_sizes is not None:
             videos_kwargs = Qwen3VLProcessorKwargs._defaults.get("videos_kwargs", {})
             videos_kwargs.update(kwargs)
+            merge_size = videos_kwargs.get("merge_size", None) or self.video_processor.merge_size
             num_video_patches = [
                 self.video_processor.get_number_of_video_patches(*video_size, videos_kwargs)
                 for video_size in video_sizes
@@ -268,4 +269,11 @@ class Qwen3VLProcessor(ProcessorMixin):
         return timestamps
 
 
-__all__ = ["Qwen3VLProcessor"]
+Qwen3_5ProcessorKwargs = Qwen3VLProcessorKwargs
+
+
+class Qwen3_5Processor(Qwen3VLProcessor):
+    """Qwen3.5-named processor alias for the local model package."""
+
+
+__all__ = ["Qwen3VLProcessor", "Qwen3_5Processor", "Qwen3VLProcessorKwargs", "Qwen3_5ProcessorKwargs"]

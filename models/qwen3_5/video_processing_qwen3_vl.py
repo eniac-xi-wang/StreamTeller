@@ -11,19 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""video processor class for Qwen3-VL."""
+"""Video processor class used by the local Qwen3.5 implementation."""
 
 import math
 
 import numpy as np
 import torch
 
-from ...feature_extraction_utils import BatchFeature
-from ...image_utils import ChannelDimension, PILImageResampling, SizeDict, get_image_size
-from ...processing_utils import Unpack, VideosKwargs
-from ...utils import TensorType, add_start_docstrings, is_torchvision_available, logging
-from ...video_processing_utils import BASE_VIDEO_PROCESSOR_DOCSTRING, BaseVideoProcessor
-from ...video_utils import VideoMetadata, group_videos_by_shape, reorder_videos
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_utils import ChannelDimension, PILImageResampling, SizeDict, get_image_size
+from transformers.processing_utils import Unpack, VideosKwargs
+from transformers.utils import TensorType, add_start_docstrings, is_torchvision_available, logging
+from transformers.video_processing_utils import BASE_VIDEO_PROCESSOR_DOCSTRING, BaseVideoProcessor
+from transformers.video_utils import VideoMetadata, group_videos_by_shape, reorder_videos
 
 
 if is_torchvision_available():
@@ -72,7 +72,7 @@ class Qwen3VLVideoProcessorInitKwargs(VideosKwargs, total=False):
 
 
 @add_start_docstrings(
-    "Constructs a fast Qwen3-VL image processor that dynamically resizes videos based on the original videos.",
+    "Constructs a fast Qwen3.5 video processor that dynamically resizes videos based on the original videos.",
     BASE_VIDEO_PROCESSOR_DOCSTRING,
     """
         patch_size (`int`, *optional*, defaults to 16):
@@ -95,7 +95,7 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
     patch_size = 16
     temporal_patch_size = 2
     merge_size = 2
-    fps = 2
+    fps = 1
     min_frames = 4
     max_frames = 768
     do_sample_frames = True
@@ -150,10 +150,10 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         # If num_frames is not given but fps is, calculate num_frames from fps
         if num_frames is None and fps is not None:
             if metadata.fps is None:
-                metadata.fps = 24
+                metadata.fps = 1
                 logger.warning_once(
                     "Asked to sample `fps` frames per second but no video metadata was provided which is required when sampling with `fps`. "
-                    "Defaulting to `fps=24`. Please provide `video_metadata` for more accurate results."
+                    "Defaulting to `fps=1`. Please provide `video_metadata` for more accurate results."
                 )
             num_frames = int(total_num_frames / metadata.fps * fps)
             num_frames = min(max(num_frames, self.min_frames), self.max_frames, total_num_frames)
@@ -266,4 +266,11 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         return BatchFeature(data=data, tensor_type=return_tensors)
 
 
-__all__ = ["Qwen3VLVideoProcessor"]
+class Qwen3_5VideoProcessor(Qwen3VLVideoProcessor):
+    """Qwen3.5-named alias with project defaults for pre-sampled videos."""
+
+    fps = 1
+    do_resize = False
+
+
+__all__ = ["Qwen3VLVideoProcessor", "Qwen3_5VideoProcessor"]
