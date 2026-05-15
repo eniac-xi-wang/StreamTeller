@@ -3,6 +3,12 @@
 Takes a 16-frame 256x256 video window, runs it through V-JEPA encoder + predictor,
 and produces per-patch prediction loss. High-loss patches are harder to predict and
 thus more likely to contain informative content worth keeping.
+
+P0 fixes applied:
+- Target encoder (EMA) vs context encoder separation (no cross-attention leakage)
+- Masked context encoding: context encoder only sees context patches
+- loss_exp in config, unified loss = mean(abs(pred - target) ** loss_exp) / loss_exp
+- Online tubelet scoring: only produce keep mask for the current new tubelet
 """
 
 from dataclasses import dataclass
@@ -26,63 +32,118 @@ class PredictMemScore:
 class VJEPAPredictLossScorer:
     """V-JEPA-based prediction loss scorer for video token pruning.
 
+    Uses separate target encoder (EMA) and context encoder.
+    Context encoder runs with target patches masked out to prevent leakage.
+
     Main entry point::
 
-        scorer = VJEPAPredictLossScorer(config, encoder, predictor)
+        scorer = VJEPAPredictLossScorer(config, context_encoder, target_encoder, predictor)
         score = scorer.score_window(frames_256)  # [B, 3, 16, 256, 256] -> PredictMemScore
     """
 
     def __init__(
         self,
         config: PredictMemConfig,
-        encoder: nn.Module,
+        context_encoder: nn.Module,
+        target_encoder: nn.Module,
         predictor: nn.Module,
+        degraded: bool = False,
     ):
         self.config = config
-        self.encoder = encoder
+        self.context_encoder = context_encoder
+        self.target_encoder = target_encoder
         self.predictor = predictor
+        self.degraded = degraded  # True if context_encoder == target_encoder
         self.grid_t = config.jepa_grid_t  # 8
         self.grid_h = config.jepa_grid_h  # 16
         self.grid_w = config.jepa_grid_w  # 16
         self.num_patches = self.grid_t * self.grid_h * self.grid_w  # 2048
+        self.num_tubelet_patches = self.grid_h * self.grid_w  # 256
+        self.num_tubelets = self.grid_t  # 8
+
+    @torch.no_grad()
+    def score_tubelet(
+        self,
+        frames_256: torch.Tensor,
+        target_tubelet_id: int,
+    ) -> torch.Tensor:
+        """Score a single tubelet: compute prediction loss for target_tubelet_id.
+
+        Context = all patches EXCEPT the target tubelet's patches.
+        Target encoder sees full input; context encoder sees context only.
+
+        Args:
+            frames_256: [B, 3, 16, 256, 256]
+            target_tubelet_id: 0..7, which tubelet to predict
+
+        Returns:
+            loss: [B, 256] per-patch prediction loss for the target tubelet.
+        """
+        B, device = frames_256.shape[0], frames_256.device
+        H, W = self.grid_h, self.grid_w
+        N = self.num_tubelet_patches  # 256
+        tubelet_start = target_tubelet_id * N
+        tubelet_end = tubelet_start + N
+
+        # Context mask: all patches except the target tubelet
+        context_indices = torch.cat([
+            torch.arange(0, tubelet_start, device=device),
+            torch.arange(tubelet_end, self.num_patches, device=device),
+        ])
+        context_mask_tensor = context_indices.unsqueeze(0).expand(B, -1)  # [B, N_ctxt]
+
+        # Target mask: the target tubelet patches
+        target_indices = torch.arange(tubelet_start, tubelet_end, device=device)
+        target_mask_tensor = target_indices.unsqueeze(0).expand(B, -1)  # [B, N]
+
+        # Target encoder: full input, no mask  → target latents
+        target_embeddings = self.target_encoder(frames_256)  # [B, 2048, D]
+        target_tubelet_emb = target_embeddings[:, tubelet_start:tubelet_end, :]  # [B, 256, D]
+
+        # Context encoder: masked input, only context patches
+        # V-JEPA encoder.forward(x, masks=[...]) where masks is list of [B, K] keep indices
+        context_embeddings = self.context_encoder(
+            frames_256, masks=[context_mask_tensor]
+        )  # [B, N_ctxt, D]
+
+        # Predictor: context → target
+        predictions = self.predictor(
+            context_embeddings,
+            masks_x=context_mask_tensor,
+            masks_y=target_mask_tensor,
+        )  # [B, N, D]
+
+        # Loss: mean(abs(pred - target) ** loss_exp) / loss_exp
+        p = self.config.loss_exp
+        diff = predictions - target_tubelet_emb
+        loss = diff.abs().pow(p).mean(dim=-1) / p  # [B, N]
+
+        return loss
 
     @torch.no_grad()
     def score_window(self, frames_256: torch.Tensor) -> PredictMemScore:
-        """Score a 16-frame video window.
+        """Score a 16-frame video window in offline mode.
+
+        Offline: scores all 8 tubelets, assembles full [8,16,16] loss map.
 
         Args:
-            frames_256: [B, 3, 16, 256, 256] float tensor in [0, 1] or normalized.
+            frames_256: [B, 3, 16, 256, 256]
 
         Returns:
-            PredictMemScore with loss_map, keep_mask, and keep_indices.
+            PredictMemScore with loss_map, keep_mask, keep_indices.
         """
-        B = frames_256.shape[0]
-        device = frames_256.device
+        B, device = frames_256.shape[0], frames_256.device
 
-        # 1. Run encoder on full input to get target latents for all patches
-        full_embeddings = self.encoder(frames_256)  # [B, 2048, D]
-        # The last tubelet (tubelet 7) corresponds to positions 1792..2047
-        target_embeddings = full_embeddings[:, -256:, :]  # [B, 256, D]
+        # Score each tubelet independently
+        all_tubelet_losses = []
+        for t in range(self.num_tubelets):
+            loss_t = self.score_tubelet(frames_256, target_tubelet_id=t)  # [B, 256]
+            all_tubelet_losses.append(loss_t)
 
-        # 2. Run encoder on context-only input (mask out last tubelet)
-        context_indices = torch.arange(0, 256 * 7, device=device)  # 0..1791
-        context_mask = context_indices.unsqueeze(0).expand(B, -1)  # [B, 1792]
-        context_embeddings = self._encode_masked(frames_256, context_mask)  # [B, 1792, D]
+        # Assemble full loss map: [B, 8, 16, 16]
+        loss_map = torch.stack(all_tubelet_losses, dim=1).view(B, self.grid_t, self.grid_h, self.grid_w)
 
-        # 3. Run predictor: context -> target
-        target_indices = torch.arange(256 * 7, 256 * 8, device=device)  # 1792..2047
-        target_mask = target_indices.unsqueeze(0).expand(B, -1)  # [B, 256]
-        predictions = self._predict(context_embeddings, context_mask, target_mask)  # [B, 256, D]
-
-        # 4. Compute per-patch prediction loss
-        loss = (predictions - target_embeddings).abs().pow(2).mean(dim=-1)  # [B, 256]
-
-        # 5. Assemble full loss_map (only target tubelet has scores; context set to 0)
-        loss_map = torch.zeros(B, self.num_patches, device=device)
-        loss_map[:, 256 * 7 : 256 * 8] = loss
-        loss_map = loss_map.view(B, self.grid_t, self.grid_h, self.grid_w)
-
-        # 6. Generate keep mask from loss map
+        # Generate keep mask
         keep_mask, keep_indices = self._loss_to_keep_mask(loss_map)
 
         return PredictMemScore(
@@ -91,41 +152,118 @@ class VJEPAPredictLossScorer:
             keep_indices=keep_indices,
         )
 
-    def _encode_masked(self, frames: torch.Tensor, keep_indices: torch.Tensor) -> torch.Tensor:
-        """Run encoder with only specified patches kept.
-
-        Args:
-            frames: [B, 3, 16, 256, 256]
-            keep_indices: [B, K] flat indices of patches to keep
-
-        Returns:
-            [B, K, D] embeddings for kept patches.
-        """
-        # Run encoder on full input, then gather kept positions
-        full_emb = self.encoder(frames)  # [B, 2048, D]
-        idx = keep_indices.unsqueeze(-1).expand(-1, -1, full_emb.size(-1))
-        return torch.gather(full_emb, dim=1, index=idx)
-
-    def _predict(
+    @torch.no_grad()
+    def score_window_online(
         self,
-        context_embeddings: torch.Tensor,
-        context_mask: torch.Tensor,
-        target_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Predict target latents from context.
+        frames_256: torch.Tensor,
+        new_tubelet_id: int,
+        history_keep_mask: torch.Tensor | None = None,
+    ) -> PredictMemScore:
+        """Online mode: only score the current new tubelet, merge with history.
 
         Args:
-            context_embeddings: [B, N_ctxt, D] encoded context patches
-            context_mask: [B, N_ctxt] indices of context patches in full grid
-            target_mask: [B, N_tgt] indices of target patches in full grid
+            frames_256: [B, 3, 16, 256, 256]
+            new_tubelet_id: 0..7, the newly arrived 2-frame tubelet to score
+            history_keep_mask: [B, 8, 16, 16] or None, previous tubelets' keep decisions
 
         Returns:
-            [B, N_tgt, D] predicted target latents.
+            PredictMemScore where keep_mask merges new decision with history.
         """
-        return self.predictor(context_embeddings, masks_x=context_mask, masks_y=target_mask)
+        B, device = frames_256.shape[0], frames_256.device
+
+        # Score only the new tubelet
+        loss_new = self.score_tubelet(frames_256, target_tubelet_id=new_tubelet_id)  # [B, 256]
+
+        # Build loss map: zero for history, new loss for new tubelet
+        loss_map = torch.zeros(B, self.grid_t, self.grid_h, self.grid_w, device=device)
+        loss_map[:, new_tubelet_id, :, :] = loss_new.view(B, self.grid_h, self.grid_w)
+
+        # Compute keep decision for new tubelet only
+        num_keep_per_tubelet = max(1, int(self.num_tubelet_patches * self.config.keep_ratio))
+        keep_mask = torch.zeros(B, self.grid_t, self.grid_h, self.grid_w, dtype=torch.bool, device=device)
+        keep_indices = []
+
+        # Restore history keep mask
+        if history_keep_mask is not None:
+            keep_mask = history_keep_mask.clone()
+            # Zero out the new tubelet in history (will be recomputed)
+            keep_mask[:, new_tubelet_id, :, :] = False
+
+        for b in range(B):
+            new_loss = loss_new[b]  # [256]
+            if self.config.min_cell_keep:
+                keep_local = self._topk_2d_with_cell_coverage(
+                    new_loss.view(self.grid_h, self.grid_w), num_keep_per_tubelet
+                )
+            elif self.config.score_mode == "rank":
+                _, top = torch.topk(new_loss, num_keep_per_tubelet)
+                keep_local = top
+            else:
+                _, top = torch.topk(new_loss, num_keep_per_tubelet)
+                keep_local = top
+
+            # Set keep in new tubelet
+            keep_h = keep_local // self.grid_w
+            keep_w = keep_local % self.grid_w
+            keep_mask[b, new_tubelet_id, keep_h, keep_w] = True
+
+            # Build flat keep indices for entire window
+            all_kept = torch.where(keep_mask[b].flatten())[0]
+            keep_indices.append(all_kept.sort().values)
+
+        # Fill loss map with full window loss if we want it (cache it)
+        # For online, we only compute the new tubelet loss
+        return PredictMemScore(
+            loss_map=loss_map,
+            keep_mask=keep_mask,
+            keep_indices=keep_indices,
+        )
+
+    def _topk_2d_with_cell_coverage(
+        self, loss_2d: torch.Tensor, total_keep: int
+    ) -> torch.Tensor:
+        """Per-tubelet top-k with spatial cell coverage on the 16x16 grid.
+
+        Args:
+            loss_2d: [H, W] = [16, 16] loss within one tubelet
+            total_keep: number of patches to keep
+
+        Returns:
+            [K] flat indices within the 16x16 grid.
+        """
+        G = self.config.cell_grid_size  # 4
+        H, W = loss_2d.shape  # 16, 16
+        cells_h, cells_w = H // G, W // G  # 4x4
+
+        cell_kept = set()
+        for ci in range(G):
+            for cj in range(G):
+                h_start, h_end = ci * cells_h, (ci + 1) * cells_h
+                w_start, w_end = cj * cells_w, (cj + 1) * cells_w
+                cell_loss = loss_2d[h_start:h_end, w_start:w_end]
+                best_local = cell_loss.argmax().item()
+                best_h = best_local // cells_w
+                best_w = best_local % cells_w
+                best_global = (h_start + best_h) * W + (w_start + best_w)
+                cell_kept.add(best_global)
+
+        min_keeps = torch.tensor(sorted(cell_kept), device=loss_2d.device)
+        remaining = total_keep - len(min_keeps)
+
+        if remaining > 0:
+            flat = loss_2d.flatten()
+            mask = torch.ones(len(flat), dtype=torch.bool, device=loss_2d.device)
+            mask[min_keeps] = False
+            remaining_loss = flat[mask]
+            remaining_indices = torch.arange(len(flat), device=loss_2d.device)[mask]
+            _, top = torch.topk(remaining_loss, min(remaining, len(remaining_loss)))
+            extra = remaining_indices[top]
+            return torch.cat([min_keeps, extra]).sort().values
+
+        return min_keeps
 
     def _loss_to_keep_mask(self, loss_map: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Convert loss map to keep mask based on score_mode and keep_ratio.
+        """Convert full loss map to keep mask based on score_mode and keep_ratio.
 
         Args:
             loss_map: [B, T, H, W] per-patch prediction loss
@@ -174,7 +312,7 @@ class VJEPAPredictLossScorer:
         """Top-k selection with minimum coverage per spatial cell.
 
         Divides the 16x16 spatial grid into cell_grid_size x cell_grid_size cells
-        and ensures each cell keeps at least one patch.
+        and ensures each cell keeps at least one patch across all tubelets.
         """
         G = self.config.cell_grid_size  # 4
         T = self.grid_t  # 8
@@ -182,9 +320,7 @@ class VJEPAPredictLossScorer:
         W = self.grid_w  # 16
         cells_h, cells_w = H // G, W // G  # 4x4
 
-        # First, pick the best patch in each cell
         cell_kept = set()
-        loss_2d = flat_loss.view(T * H, W)
         for ti in range(T):
             for ci in range(G):
                 for cj in range(G):
@@ -201,7 +337,6 @@ class VJEPAPredictLossScorer:
         remaining = total_keep - len(min_cell_keeps)
 
         if remaining > 0:
-            # Mask out already-kept, pick top-k from remaining
             all_indices = torch.arange(len(flat_loss), device=flat_loss.device)
             mask = torch.ones(len(flat_loss), dtype=torch.bool, device=flat_loss.device)
             mask[min_cell_keeps] = False
@@ -213,63 +348,58 @@ class VJEPAPredictLossScorer:
 
         return min_cell_keeps
 
-    def compute_loss_only(self, frames_256: torch.Tensor, tubelet_id: int = 7) -> torch.Tensor:
-        """Compute prediction loss for a specific tubelet without masking.
-
-        Simplified path: one encoder pass, extract target tubelet and remaining
-        context, predict, compute loss.
-
-        Args:
-            frames_256: [B, 3, 16, 256, 256]
-            tubelet_id: Which tubelet to score (default 7 = last).
-
-        Returns:
-            loss_map: [B, 256] flat per-patch loss for the target tubelet.
-        """
-        B = frames_256.shape[0]
-        device = frames_256.device
-        H, W = self.grid_h, self.grid_w
-        tubelet_start = tubelet_id * H * W
-        tubelet_end = tubelet_start + H * W
-
-        # Single encoder pass
-        full_emb = self.encoder(frames_256)  # [B, 2048, D]
-        target_emb = full_emb[:, tubelet_start:tubelet_end, :]
-
-        # Context: all tokens except target tubelet
-        context_indices = torch.cat([
-            torch.arange(0, tubelet_start, device=device),
-            torch.arange(tubelet_end, self.num_patches, device=device),
-        ])
-        context_mask = context_indices.unsqueeze(0).expand(B, -1)
-        context_emb = full_emb[:, context_indices, :]
-
-        # Predict target
-        target_indices = torch.arange(tubelet_start, tubelet_end, device=device)
-        target_mask = target_indices.unsqueeze(0).expand(B, -1)
-        pred = self.predictor(context_emb, masks_x=context_mask, masks_y=target_mask)
-
-        loss = (pred - target_emb).abs().pow(2).mean(dim=-1)  # [B, 256]
-        return loss
-
 
 def keep_indices_to_thw(indices: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """Convert flat indices to (t, h, w) coordinates.
-
-    Args:
-        indices: [K] flat indices in [0, T*H*W)
-        H: grid height
-        W: grid width
-
-    Returns:
-        [K, 3] tensor of (t, h, w) coordinates.
-    """
+    """Convert flat indices to (t, h, w) coordinates."""
     area = H * W
     t = indices // area
     residual = indices % area
     h = residual // W
     w = residual % W
     return torch.stack([t, h, w], dim=-1)
+
+
+# ─── Checkpoint loader ────────────────────────────────────────────────────────
+
+def _clean_backbone_keys(state_dict: dict) -> dict:
+    """Strip module./backbone. prefixes from checkpoint keys."""
+    new = {}
+    for key, val in state_dict.items():
+        k = key.replace("module.", "").replace("backbone.", "")
+        new[k] = val
+    return new
+
+
+def load_vjepa_checkpoint(
+    checkpoint_path: str | Path,
+    device: str = "cpu",
+    strict_encoder: bool = False,
+    strict_predictor: bool = False,
+) -> dict[str, dict]:
+    """Load a V-JEPA checkpoint and extract all recognized sub-model states.
+
+    Recognized top-level keys:
+        encoder, target_encoder, ema_encoder, predictor
+
+    Each undergoes module./backbone. key stripping.
+
+    Returns:
+        dict with keys found in the checkpoint, e.g.:
+        {"encoder": {...}, "target_encoder": {...}, "predictor": {...}}
+    """
+    checkpoint_path = Path(checkpoint_path)
+    state_dict = torch.load(checkpoint_path, map_location=device)
+
+    recognized = {}
+    for key in ["encoder", "target_encoder", "ema_encoder", "predictor"]:
+        if key in state_dict:
+            recognized[key] = _clean_backbone_keys(state_dict[key])
+
+    if not recognized:
+        # Maybe the whole state_dict is a raw encoder
+        recognized["encoder"] = _clean_backbone_keys(state_dict)
+
+    return recognized
 
 
 def make_vjepa_encoder_predictor(
@@ -285,25 +415,13 @@ def make_vjepa_encoder_predictor(
     predictor_num_heads: int = 12,
     checkpoint_path: str | None = None,
     device: str = "cpu",
-) -> tuple[nn.Module, nn.Module]:
-    """Build V-JEPA encoder + predictor, optionally loading pretrained weights.
-
-    Args:
-        img_size: Spatial input size (256 for standard V-JEPA).
-        patch_size: Patch size (16).
-        num_frames: Number of input frames (16).
-        tubelet_size: Temporal patch size (2).
-        embed_dim: Encoder embedding dimension.
-        encoder_depth: Encoder depth.
-        encoder_num_heads: Encoder number of heads.
-        predictor_embed_dim: Predictor embedding dimension.
-        predictor_depth: Predictor depth.
-        predictor_num_heads: Predictor number of heads.
-        checkpoint_path: Optional path to pretrained .pt checkpoint.
-        device: Device to load models on.
+    strict_encoder: bool = False,
+    strict_predictor: bool = False,
+) -> dict:
+    """Build V-JEPA context/target encoders + predictor, loading weights if available.
 
     Returns:
-        (encoder, predictor) tuple.
+        dict with keys: context_encoder, target_encoder, predictor, degraded, keys_found
     """
     import sys
     vjepa_src = Path(__file__).parent.parent.parent / "site-packages" / "vjepa2"
@@ -312,7 +430,8 @@ def make_vjepa_encoder_predictor(
     from src.models import vision_transformer as vit_encoder
     from src.models import predictor as vit_predictor
 
-    encoder = vit_encoder.vit_large(
+    # Build encoders
+    encoder_kwargs = dict(
         img_size=(img_size, img_size),
         patch_size=patch_size,
         num_frames=num_frames,
@@ -324,7 +443,11 @@ def make_vjepa_encoder_predictor(
         use_rope=True,
     )
 
-    predictor = vit_predictor.vit_predictor(
+    context_encoder = vit_encoder.vit_large(**encoder_kwargs)
+    target_encoder = vit_encoder.vit_large(**encoder_kwargs)
+
+    # Build predictor
+    predictor_kwargs = dict(
         img_size=(img_size, img_size),
         patch_size=patch_size,
         num_frames=num_frames,
@@ -340,12 +463,54 @@ def make_vjepa_encoder_predictor(
         use_silu=False,
         wide_silu=True,
     )
+    predictor = vit_predictor.vit_predictor(**predictor_kwargs)
+
+    degraded = False
+    keys_found = []
 
     if checkpoint_path is not None and Path(checkpoint_path).exists():
-        state_dict = torch.load(checkpoint_path, map_location=device)
-        encoder.load_state_dict(state_dict.get("encoder", state_dict), strict=False)
-        predictor.load_state_dict(state_dict.get("predictor", {}), strict=False)
+        ckpt = load_vjepa_checkpoint(checkpoint_path, device=device)
+        keys_found = list(ckpt.keys())
 
-    encoder.to(device)
+        # Load target encoder (prefer target_encoder > ema_encoder > encoder)
+        target_key = None
+        if "target_encoder" in ckpt:
+            target_key = "target_encoder"
+        elif "ema_encoder" in ckpt:
+            target_key = "ema_encoder"
+        elif "encoder" in ckpt:
+            target_key = "encoder"
+            degraded = True
+
+        if target_key:
+            target_encoder.load_state_dict(ckpt[target_key], strict=strict_encoder)
+
+        # Load context encoder (prefer encoder > target_encoder)
+        context_key = None
+        if "encoder" in ckpt:
+            context_key = "encoder"
+        elif "target_encoder" in ckpt:
+            context_key = "target_encoder"
+            degraded = True
+
+        if context_key:
+            context_encoder.load_state_dict(ckpt[context_key], strict=strict_encoder)
+
+        # Load predictor
+        if "predictor" in ckpt:
+            predictor.load_state_dict(ckpt["predictor"], strict=strict_predictor)
+
+    context_encoder.to(device)
+    target_encoder.to(device)
     predictor.to(device)
-    return encoder, predictor
+    context_encoder.eval()
+    target_encoder.eval()
+    predictor.eval()
+
+    return {
+        "context_encoder": context_encoder,
+        "target_encoder": target_encoder,
+        "predictor": predictor,
+        "degraded": degraded,
+        "keys_found": keys_found,
+    }

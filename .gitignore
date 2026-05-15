@@ -35,4 +35,6 @@ results/
 #AI Assistant
 CLAUDE.md
 Experiment.md
+results.md
+instruct.md
 .agents

@@ -20,6 +20,7 @@ class PredictMemConfig:
     score_mode: str = "rank"  # rank | zscore | raw
     runtime_mode: str = "offline"  # offline | online
     score_cache_path: str | None = None
+    loss_exp: float = 1.0  # exponent for V-JEPA prediction loss
 
     # Derived properties (computed on access, not stored)
     jepa_grid_t: int = field(init=False, default=8)
