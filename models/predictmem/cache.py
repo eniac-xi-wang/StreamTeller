@@ -62,7 +62,11 @@ class ScoreCache:
         return loss_map.reshape(grid_shape)
 
     def get_keep_indices(self, sample_id: str) -> torch.Tensor | None:
-        """Get flat keep indices (local video token positions)."""
+        """Get flat JEPA keep indices from the cached JEPA keep mask.
+
+        These indices are in the V-JEPA 8x16x16 token space. Use TokenMapper
+        before applying them to Qwen video tokens when the Qwen grid differs.
+        """
         keep_mask = self.get_keep_mask(sample_id)
         if keep_mask is None:
             return None
