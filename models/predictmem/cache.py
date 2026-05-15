@@ -79,16 +79,32 @@ class ScoreCache:
         loss_map: torch.Tensor,
         keep_mask: torch.Tensor,
         keep_indices: torch.Tensor | None = None,
+        window_id: int | None = None,
+        window_start_s: float | None = None,
+        window_end_s: float | None = None,
+        source_indices: list | None = None,
     ):
         self._ensure_loaded()
         grid_shape = list(keep_mask.shape)
-        self._data[sample_id] = {
+        entry = {
             "sample_id": sample_id,
             "keep_mask": keep_mask.flatten().tolist(),
             "loss_map": loss_map.flatten().tolist(),
             "grid_shape": grid_shape,
             "keep_indices": keep_indices.flatten().tolist() if keep_indices is not None else [],
         }
+        if window_id is not None:
+            entry["window_id"] = window_id
+            entry["cache_key"] = f"{sample_id}:{window_id}"
+        if window_start_s is not None:
+            entry["window_start_s"] = round(window_start_s, 2)
+        if window_end_s is not None:
+            entry["window_end_s"] = round(window_end_s, 2)
+        if source_indices is not None:
+            entry["source_indices"] = source_indices
+        # Use cache_key if available, otherwise sample_id
+        key = entry.get("cache_key", sample_id)
+        self._data[key] = entry
 
     def flush(self):
         """Write all cached data to disk."""
