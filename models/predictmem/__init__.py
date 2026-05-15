@@ -2,6 +2,7 @@ from .config import PredictMemConfig
 from .token_mapping import TokenMapper
 from .token_pruner import TokenPruner
 from .cache import ScoreCache
+from .video_sampling import DecordVideoSample, sample_video_1fps_decord
 from .vjepa_scorer import (
     VJEPAPredictLossScorer,
     PredictMemScore,
@@ -15,6 +16,8 @@ __all__ = [
     "TokenMapper",
     "TokenPruner",
     "ScoreCache",
+    "DecordVideoSample",
+    "sample_video_1fps_decord",
     "VJEPAPredictLossScorer",
     "PredictMemScore",
     "keep_indices_to_thw",
