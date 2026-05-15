@@ -1,0 +1,38 @@
+# Dependencies
+site-packages/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project outputs
+test/
+results/
+
+# Environment
+.env
+.env.local
+
+#AI Assistant
+CLAUDE.md
+Experiment.md
+.agents
