@@ -76,14 +76,15 @@ class TokenPruner:
             is_kept[~is_video] = True  # keep all non-video tokens
 
             new_embeds_list.append(inputs_embeds[b][is_kept])
-            # position_ids: [3, B, L] -> select columns
+            # position_ids: [P, B, L] -> select columns (P=3 for Qwen3.5, P=4 for Qwen3-VL)
             new_pos_list.append(position_ids[:, b, is_kept])
             max_len = max(max_len, is_kept.sum().item())
 
         # Pad to max length
         new_L = max_len
+        P = position_ids.shape[0]  # 3 or 4
         padded_embeds = torch.zeros(B, new_L, D, device=device, dtype=dtype)
-        padded_pos = torch.zeros(3, B, new_L, device=device, dtype=position_ids.dtype)
+        padded_pos = torch.zeros(P, B, new_L, device=device, dtype=position_ids.dtype)
         new_attention_mask = torch.zeros(B, new_L, device=device, dtype=torch.long)
 
         for b in range(B):

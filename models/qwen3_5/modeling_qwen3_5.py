@@ -1958,7 +1958,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         # ---- PredictMem label pruning ----
         if use_predictmem and predictmem_keep_indices is not None and labels is not None and pixel_values_videos is not None:
-            if inputs_embeds.shape[1] > 1:
+            seq_len_for_labels = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+            if seq_len_for_labels > 1:
                 # Prune labels to match the pruned sequence length
                 pruned_labels_list = []
                 B = labels.shape[0]
