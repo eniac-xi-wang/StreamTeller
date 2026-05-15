@@ -30,6 +30,7 @@ if str(_models_dir) not in sys.path:
     sys.path.insert(0, str(_models_dir))
 
 from predictmem.config import PredictMemConfig
+from predictmem.token_mapping import TokenMapper
 from predictmem.token_pruner import TokenPruner
 from predictmem.cache import ScoreCache
 
@@ -136,16 +137,24 @@ class PredictMemPatcher:
             )
             if should_prune:
                 ki_device = [ki.to(inputs_embeds.device) for ki in patcher.keep_indices]
+                sequence_keep_masks = patcher.pruner.build_sequence_keep_masks(
+                    input_ids=input_ids,
+                    video_keep_indices=ki_device,
+                    attention_mask=attention_mask,
+                )
+                if visual_pos_masks is not None:
+                    deepstack_visual_embeds = TokenPruner.prune_deepstack_visual_embeds(
+                        deepstack_visual_embeds,
+                        visual_pos_masks,
+                        sequence_keep_masks,
+                    )
+                    visual_pos_masks = TokenPruner.prune_token_mask(visual_pos_masks, sequence_keep_masks)
                 inputs_embeds, position_ids, new_attention_mask = patcher.pruner.prune(
                     input_ids=input_ids, inputs_embeds=inputs_embeds,
                     position_ids=position_ids, attention_mask=attention_mask,
                     video_keep_indices=ki_device,
                 )
                 attention_mask = new_attention_mask
-                # Deepstack features are incompatible with pruned sequence
-                # (indices would misalign); set to None to bypass deepstack attention
-                visual_pos_masks = None
-                deepstack_visual_embeds = None
 
             outputs = patcher.model.model.language_model(
                 input_ids=None, position_ids=position_ids,
@@ -236,53 +245,10 @@ def main():
         sys.exit(1)
     print(f"  Frames shape: {frames_np.shape}")
 
-    # ── Get keep indices ────────────────────────────────────────────────────
+    # Keep indices are computed after processing, because Qwen token count comes
+    # from the actual video_grid_thw produced by the processor.
     keep_indices = None
-    num_qwen_video_tokens = 512  # Qwen3-VL: video_grid_thw=[2,32,32] -> 2*16*16=512
-
-    if args.method == "predictmem":
-        cache = ScoreCache(args.cache_path)
-        if not cache.has(args.sample_id):
-            print(f"ERROR: sample {args.sample_id} not in cache")
-            sys.exit(1)
-        # V-JEPA produces 2048-token keep mask [1,8,16,16]; downsample to 512 for Qwen3-VL
-        jepa_keep_mask = cache.get_keep_mask(args.sample_id)  # [1, 8, 16, 16] or [8, 16, 16]
-        if jepa_keep_mask.ndim == 4:
-            jepa_keep_mask = jepa_keep_mask[0]  # squeeze batch -> [8, 16, 16]
-        # Qwen3-VL has 2 temporal × 16 × 16 = 512 tokens
-        # V-JEPA has 8 tubelets × 16 × 16 = 2048 tokens
-        # Mapping: Qwen temporal qt covers V-JEPA tubelets qt*4..qt*4+3
-        # Aggregate: count how many of the 4 source tubelets keep each position
-        H, W = 16, 16
-        keep_counts = torch.zeros(2, H, W, dtype=torch.int)
-        for jt in range(8):
-            qt = jt // 4
-            keep_counts[qt] += jepa_keep_mask[jt].int()
-        # A Qwen token is "kept" if at least 2 of 4 source V-JEPA tubelets keep it
-        qwen_keep = keep_counts >= 2
-        flat_keep = qwen_keep.flatten()  # [512]
-        keep_idx_tensor = torch.where(flat_keep)[0]
-
-        # Limit to target keep_ratio
-        target_keep = max(1, int(num_qwen_video_tokens * args.keep_ratio))
-        if len(keep_idx_tensor) > target_keep:
-            # Select top by V-JEPA keep count
-            flat_counts = keep_counts.flatten()
-            _, top_idx = torch.topk(flat_counts[keep_idx_tensor].float(), target_keep)
-            keep_idx_tensor = keep_idx_tensor[top_idx]
-        elif len(keep_idx_tensor) < target_keep:
-            remaining = target_keep - len(keep_idx_tensor)
-            all_idx = torch.arange(num_qwen_video_tokens)
-            not_kept = all_idx[~flat_keep]
-            flat_counts = keep_counts.flatten()
-            _, top_remaining = torch.topk(flat_counts[not_kept].float(), min(remaining, len(not_kept)))
-            keep_idx_tensor = torch.cat([keep_idx_tensor, not_kept[top_remaining]])
-        keep_indices = [keep_idx_tensor.sort().values]
-        n_kept = keep_indices[0].shape[0]
-        print(f"  PredictMem: {n_kept}/{num_qwen_video_tokens} tokens kept ({n_kept/num_qwen_video_tokens:.1%})")
-    else:
-        keep_indices = [torch.arange(num_qwen_video_tokens)]
-        print(f"  Baseline: {num_qwen_video_tokens}/{num_qwen_video_tokens} tokens kept")
+    num_qwen_video_tokens = None
 
     # ── Build messages ──────────────────────────────────────────────────────
     messages = [
@@ -304,6 +270,33 @@ def main():
     if "pixel_values_videos" in inputs:
         pvv = inputs["pixel_values_videos"]
         print(f"  pixel_values_videos shape: {pvv.shape if isinstance(pvv, torch.Tensor) else 'N/A'}")
+    if "video_grid_thw" not in inputs:
+        print("ERROR: processor did not return video_grid_thw")
+        sys.exit(1)
+
+    mapper = TokenMapper(config)
+    video_grid_thw = inputs["video_grid_thw"].detach().cpu()
+    num_qwen_video_tokens = mapper.compute_num_video_tokens(video_grid_thw)
+    print(f"  video_grid_thw: {video_grid_thw.tolist()} -> {num_qwen_video_tokens} Qwen video tokens")
+
+    if args.method == "predictmem":
+        cache = ScoreCache(args.cache_path)
+        if not cache.has(args.sample_id):
+            print(f"ERROR: sample {args.sample_id} not in cache")
+            sys.exit(1)
+        loss_map = cache.get_loss_map(args.sample_id)
+        keep_mask = None if loss_map is not None else cache.get_keep_mask(args.sample_id)
+        keep_indices = mapper.map_scores_to_qwen_keep_indices(
+            video_grid_thw=video_grid_thw,
+            loss_map=loss_map,
+            keep_mask=keep_mask,
+            keep_ratio=args.keep_ratio,
+        )
+        n_kept = keep_indices[0].shape[0]
+        print(f"  PredictMem: {n_kept}/{num_qwen_video_tokens} tokens kept ({n_kept/num_qwen_video_tokens:.1%})")
+    else:
+        keep_indices = [torch.arange(num_qwen_video_tokens)]
+        print(f"  Baseline: {num_qwen_video_tokens}/{num_qwen_video_tokens} tokens kept")
 
     # ── Generate ────────────────────────────────────────────────────────────
     print(f"\nGenerating ({args.method})...")
@@ -365,7 +358,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"Method:      {args.method}")
     print(f"Prediction:  {output_text[:200]}")
-    print(f"Kept tokens: {kept}/2048 ({kept/2048:.1%})")
+    print(f"Kept tokens: {kept}/{num_qwen_video_tokens} ({kept/num_qwen_video_tokens:.1%})")
     print(f"Total latency: {total_latency:.3f}s")
     print(f"Peak mem:      {peak_memory:.0f}MB")
     print(f"{'='*60}")

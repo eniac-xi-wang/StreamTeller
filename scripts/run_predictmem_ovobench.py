@@ -24,7 +24,7 @@ if str(_models_dir) not in sys.path:
     sys.path.insert(0, str(_models_dir))
 
 from predictmem.config import PredictMemConfig
-from predictmem.token_pruner import TokenPruner
+from predictmem.token_mapping import TokenMapper
 from predictmem.cache import ScoreCache
 
 
@@ -80,10 +80,14 @@ def load_ovo_samples(bench_path: str, max_samples: int, video_base: str) -> list
 # ─── Keep-index generators per method ─────────────────────────────────────────
 
 def generate_keep_indices(method: str, config: PredictMemConfig, sample_id: str,
-                          cache: ScoreCache | None = None, seed: int = 0) -> tuple[list, dict]:
+                          cache: ScoreCache | None = None, seed: int = 0,
+                          video_grid_thw: torch.Tensor | None = None) -> tuple[list, dict]:
     """Generate keep_indices for one sample. Returns (keep_indices_list, stats_dict)."""
-    num_tokens = config.num_qwen_video_tokens  # 2048
-    stats = {}
+    mapper = TokenMapper(config)
+    if video_grid_thw is None:
+        video_grid_thw = torch.tensor([[config.qwen_grid_t, config.qwen_grid_h, config.qwen_grid_w]])
+    num_tokens = mapper.compute_num_video_tokens(video_grid_thw)
+    stats = {"original_video_tokens": num_tokens}
 
     if method == "baseline":
         keep = [torch.arange(num_tokens)]
@@ -110,13 +114,18 @@ def generate_keep_indices(method: str, config: PredictMemConfig, sample_id: str,
 
     elif method == "predictmem":
         if cache is not None and cache.has(sample_id):
-            keep_idx = cache.get_keep_indices(sample_id)
-            if keep_idx is not None:
-                keep = [keep_idx]
-                stats["keep_ratio_actual"] = len(keep[0]) / num_tokens
-                stats["kept_video_tokens"] = len(keep[0])
-            else:
-                raise ValueError(f"Cached sample {sample_id} has no keep_indices")
+            loss_map = cache.get_loss_map(sample_id)
+            keep_mask = None if loss_map is not None else cache.get_keep_mask(sample_id)
+            if loss_map is None and keep_mask is None:
+                raise ValueError(f"Cached sample {sample_id} has neither loss_map nor keep_mask")
+            keep = mapper.map_scores_to_qwen_keep_indices(
+                video_grid_thw=video_grid_thw,
+                loss_map=loss_map,
+                keep_mask=keep_mask,
+                keep_ratio=config.keep_ratio,
+            )
+            stats["keep_ratio_actual"] = len(keep[0]) / num_tokens
+            stats["kept_video_tokens"] = len(keep[0])
         else:
             raise ValueError(f"Sample {sample_id} not in cache, run precompute first")
     else:
@@ -136,12 +145,16 @@ def main():
     parser.add_argument("--output", default="results/eval_output.jsonl")
     parser.add_argument("--max_samples", type=int, default=5)
     parser.add_argument("--keep_ratio", type=float, default=0.5)
+    parser.add_argument("--qwen_grid_t", type=int, default=8)
+    parser.add_argument("--qwen_grid_h", type=int, default=32)
+    parser.add_argument("--qwen_grid_w", type=int, default=32)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     config = PredictMemConfig()
     config.keep_ratio = args.keep_ratio
+    video_grid_thw = torch.tensor([[args.qwen_grid_t, args.qwen_grid_h, args.qwen_grid_w]])
 
     # Load cache for predictmem method
     cache = None
@@ -164,7 +177,7 @@ def main():
 
         keep_indices_list, stats = generate_keep_indices(
             method=args.method, config=config, sample_id=sample["sample_id"],
-            cache=cache, seed=args.seed + i,
+            cache=cache, seed=args.seed + i, video_grid_thw=video_grid_thw,
         )
 
         entry = {
@@ -176,7 +189,7 @@ def main():
             "method": args.method,
             "keep_ratio_target": config.keep_ratio,
             "keep_ratio_actual": stats["keep_ratio_actual"],
-            "original_video_tokens": config.num_qwen_video_tokens,
+            "original_video_tokens": stats["original_video_tokens"],
             "kept_video_tokens": stats["kept_video_tokens"],
             "score_latency_s": 0.0,
             "vision_latency_s": 0.0,

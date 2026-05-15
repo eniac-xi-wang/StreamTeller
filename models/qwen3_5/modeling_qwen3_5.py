@@ -1960,25 +1960,30 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if use_predictmem and predictmem_keep_indices is not None and labels is not None and pixel_values_videos is not None:
             seq_len_for_labels = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
             if seq_len_for_labels > 1:
-                # Prune labels to match the pruned sequence length
-                pruned_labels_list = []
-                B = labels.shape[0]
-                video_token_id = self.config.video_token_id
-                keep_indices = predictmem_keep_indices
-                for b in range(B):
-                    is_video = input_ids[b] == video_token_id
-                    video_positions = torch.where(is_video)[0]
-                    kept_video_pos = video_positions[keep_indices[b]]
-                    is_kept = torch.zeros(labels.shape[1], dtype=torch.bool, device=labels.device)
-                    is_kept[kept_video_pos] = True
-                    is_kept[~is_video] = True
-                    cur_pruned = labels[b][is_kept]
-                    # Pad to hidden_states length
-                    pad_len = hidden_states.shape[1] - len(cur_pruned)
-                    if pad_len > 0:
-                        cur_pruned = torch.cat([cur_pruned, torch.full((pad_len,), -100, device=labels.device, dtype=labels.dtype)])
-                    pruned_labels_list.append(cur_pruned)
-                labels = torch.stack(pruned_labels_list)
+                if input_ids is None:
+                    raise ValueError("PredictMem label pruning requires input_ids to locate video placeholders")
+                from ..predictmem.token_pruner import TokenPruner
+
+                pruner = TokenPruner(
+                    config=None,
+                    video_token_id=self.config.video_token_id,
+                    vision_start_token_id=self.config.vision_start_token_id,
+                    vision_end_token_id=self.config.vision_end_token_id,
+                )
+                sequence_keep_masks = pruner.build_sequence_keep_masks(
+                    input_ids=input_ids,
+                    video_keep_indices=predictmem_keep_indices,
+                    attention_mask=attention_mask,
+                )
+                labels = pruner.prune_sequence_tensor(labels, sequence_keep_masks, pad_value=-100)
+                if labels.shape[1] < hidden_states.shape[1]:
+                    pad = labels.new_full(
+                        (labels.shape[0], hidden_states.shape[1] - labels.shape[1]),
+                        -100,
+                    )
+                    labels = torch.cat([labels, pad], dim=1)
+                elif labels.shape[1] > hidden_states.shape[1]:
+                    labels = labels[:, : hidden_states.shape[1]]
 
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -2032,6 +2037,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if not is_first_iteration and use_cache:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
+
+        if "use_predictmem" in kwargs:
+            model_inputs["use_predictmem"] = kwargs["use_predictmem"]
+        if "predictmem_keep_indices" in kwargs:
+            model_inputs["predictmem_keep_indices"] = kwargs["predictmem_keep_indices"]
 
         return model_inputs
 
@@ -2210,6 +2220,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         if input_ids is not None:
             input_ids = input_ids.repeat_interleave(expand_size, dim=0)
+
+        if isinstance(model_kwargs.get("predictmem_keep_indices"), list):
+            expanded_keep_indices = []
+            for keep_idx in model_kwargs["predictmem_keep_indices"]:
+                expanded_keep_indices.extend([keep_idx] * expand_size)
+            model_kwargs["predictmem_keep_indices"] = expanded_keep_indices
 
         model_kwargs = _expand_dict_for_generation(model_kwargs)
 
