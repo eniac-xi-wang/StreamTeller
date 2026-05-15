@@ -33,6 +33,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 _repo_root = Path(__file__).parent.parent
@@ -245,11 +246,33 @@ def decode_new_tokens(processor, generated_ids: torch.Tensor, input_len: int) ->
     return processor.tokenizer.decode(output_ids, skip_special_tokens=True)
 
 
+def apply_chat_template_for_generation(processor, messages, disable_thinking: bool) -> str:
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    if disable_thinking:
+        kwargs["enable_thinking"] = False
+    try:
+        return processor.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        return processor.apply_chat_template(messages, **kwargs)
+
+
 # ─── Window Policy ───────────────────────────────────────────────────────────
 
 def get_window_bounds(video_path: str, policy: str, window_size_s: float,
-                       fps: float, max_stream_frames: int) -> tuple[float, float, float]:
-    """Return (start_time_s, end_time_s, video_duration_s) for the given policy."""
+                       fps: float, max_stream_frames: int,
+                       stream_anchor: str = "end") -> tuple[float, float, float]:
+    """Return (start_time_s, end_time_s, video_duration_s) for the given policy.
+
+    When policy='full_stream' and max_stream_frames limits the budget,
+    stream_anchor controls which part of the chunk is covered:
+      - start:  beginning of video
+      - end:    end of video (default for OVO)
+      - uniform: spaced across full duration
+    """
     import decord
     decord.bridge.set_bridge("torch")
     vr = decord.VideoReader(str(video_path))
@@ -264,8 +287,19 @@ def get_window_bounds(video_path: str, policy: str, window_size_s: float,
         end = duration
         start = max(0.0, duration - window_size_s)
     elif policy == "full_stream":
-        start = 0.0
-        end = min(duration, max_stream_frames / fps if max_stream_frames else duration)
+        budget_s = max_stream_frames / fps if max_stream_frames else duration
+        if budget_s >= duration:
+            start, end = 0.0, duration
+        elif stream_anchor == "end":
+            end = duration
+            start = max(0.0, duration - budget_s)
+        elif stream_anchor == "uniform":
+            # Spread budget across the full duration: take frames at uniform intervals
+            start = 0.0
+            end = duration
+        else:
+            start = 0.0
+            end = min(duration, budget_s)
     else:
         raise ValueError(f"Unknown window_policy: {policy}")
 
@@ -490,6 +524,17 @@ def main():
                         choices=["first16", "anchor_end16", "full_stream"])
     parser.add_argument("--max_stream_frames", type=int, default=64)
     parser.add_argument("--allow_dynamic_grid", action="store_true")
+    parser.add_argument("--disable_thinking", action="store_true",
+                        help="Pass enable_thinking=False to Qwen chat template when supported.")
+    parser.add_argument("--visual_ablation", default="normal",
+                        choices=["normal", "black", "shuffle", "text_only"],
+                        help="Visual sensitivity ablation: normal=video as-is, "
+                             "black=all-zero frames, shuffle=random temporal order, "
+                             "text_only=no video content block.")
+    parser.add_argument("--stream_anchor", default="end",
+                        choices=["start", "end", "uniform"],
+                        help="When max_stream_frames limits the budget, which part of the "
+                             "chunk to cover. OVO smoke should use 'end'.")
     args = parser.parse_args()
 
     config = PredictMemConfig()
@@ -536,10 +581,11 @@ def main():
             # Get window bounds
             window_start_s, window_end_s, video_duration_s = get_window_bounds(
                 sample["video_path"], args.window_policy, window_size_s,
-                args.fps, args.max_stream_frames,
+                args.fps, args.max_stream_frames, stream_anchor=args.stream_anchor,
             )
             print(f"  Window: [{window_start_s:.1f}s, {window_end_s:.1f}s] "
-                  f"/ {video_duration_s:.1f}s (policy={args.window_policy})")
+                  f"/ {video_duration_s:.1f}s (policy={args.window_policy}, "
+                  f"anchor={args.stream_anchor})")
 
             cache_build_latency = 0.0
             num_windows = 1
@@ -564,18 +610,22 @@ def main():
             print(f"  Frames: {frames_np.shape[0]} frames, "
                   f"indices=[{video_sample.source_indices[0]}...{video_sample.source_indices[-1]}]")
 
-            # Build messages: video + OVO prompt
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "video", "video": frames_np, "fps": config.fps},
-                        {"type": "text", "text": prompt_text},
-                    ],
-                }
-            ]
+            # P3: Visual ablation — modify frames before feeding to Qwen
+            if args.visual_ablation == "black":
+                frames_np = np.zeros_like(frames_np)
+            elif args.visual_ablation == "shuffle":
+                perm = np.random.permutation(len(frames_np))
+                frames_np = frames_np[perm]
+            # text_only: skip adding video content block
 
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            # Build messages: video + OVO prompt
+            content_blocks = []
+            if args.visual_ablation != "text_only":
+                content_blocks.append({"type": "video", "video": frames_np, "fps": config.fps})
+            content_blocks.append({"type": "text", "text": prompt_text})
+            messages = [{"role": "user", "content": content_blocks}]
+
+            text = apply_chat_template_for_generation(processor, messages, args.disable_thinking)
             inputs = processor(
                 text=[text], videos=[frames_np],
                 video_metadata=[video_sample.qwen_metadata()],
@@ -587,6 +637,21 @@ def main():
             video_grid_thw = inputs["video_grid_thw"].detach().cpu()
             num_qwen_video_tokens = mapper.compute_num_video_tokens(video_grid_thw)
             print(f"  video_grid_thw: {video_grid_thw.tolist()} -> {num_qwen_video_tokens} Qwen video tokens")
+            tokenizer = processor.tokenizer
+            video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
+            input_ids_cpu = inputs["input_ids"][0].detach().cpu()
+            video_token_count = int((input_ids_cpu == video_token_id).sum().item())
+            mm_video_token_count = None
+            if "mm_token_type_ids" in inputs:
+                mm_video_token_count = int((inputs["mm_token_type_ids"][0].detach().cpu() == 2).sum().item())
+            pixel_values_videos_shape = (
+                list(inputs["pixel_values_videos"].shape) if "pixel_values_videos" in inputs else None
+            )
+            token_count_match = (
+                video_token_count == num_qwen_video_tokens
+                and (mm_video_token_count is None or mm_video_token_count == num_qwen_video_tokens)
+                and pixel_values_videos_shape is not None
+            )
 
             # Generate keep indices
             if args.window_policy == "full_stream" and args.method == "predictmem" and global_scores is not None:
@@ -652,6 +717,9 @@ def main():
                 "score": score,
                 "method": args.method,
                 "window_policy": args.window_policy,
+                "stream_anchor": args.stream_anchor,
+                "visual_ablation": args.visual_ablation,
+                "disable_thinking": args.disable_thinking,
                 "window_start_s": round(window_start_s, 2),
                 "window_end_s": round(window_end_s, 2),
                 "video_duration_s": round(video_duration_s, 2),
@@ -660,6 +728,14 @@ def main():
                 "num_frames": frames_np.shape[0],
                 "qwen_size": config.qwen_size,
                 "video_grid_thw": video_grid_thw.tolist(),
+                "chat_contains_video_pad": "<|video_pad|>" in text,
+                "chat_opens_thinking": text.rstrip().endswith("<think>"),
+                "chat_has_empty_think_block": "<think>\n\n</think>" in text,
+                "video_token_count": video_token_count,
+                "mm_video_token_count": mm_video_token_count,
+                "expected_video_token_count": num_qwen_video_tokens,
+                "pixel_values_videos_shape": pixel_values_videos_shape,
+                "token_count_match": token_count_match,
                 "keep_ratio_target": config.keep_ratio,
                 "keep_ratio_actual": round(keep_ratio_actual, 3),
                 "original_video_tokens": num_qwen_video_tokens,
@@ -699,6 +775,9 @@ def main():
                 "score": 0,
                 "method": args.method,
                 "window_policy": args.window_policy,
+                "stream_anchor": args.stream_anchor,
+                "visual_ablation": args.visual_ablation,
+                "disable_thinking": args.disable_thinking,
                 "window_start_s": 0.0,
                 "window_end_s": 0.0,
                 "video_duration_s": 0.0,
