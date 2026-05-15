@@ -31,7 +31,6 @@ class TokenMapper:
     def _validate_config(self):
         cfg = self.config
         assert cfg.qwen_merge_size > 0, f"Expected positive qwen_merge_size, got {cfg.qwen_merge_size}"
-        assert cfg.jepa_grid_t == 8, f"Expected jepa_grid_t=8, got {cfg.jepa_grid_t}"
         assert cfg.jepa_grid_h == 16, f"Expected jepa_grid_h=16, got {cfg.jepa_grid_h}"
         assert cfg.jepa_grid_w == 16, f"Expected jepa_grid_w=16, got {cfg.jepa_grid_w}"
 
@@ -234,7 +233,9 @@ class TokenMapper:
         if reduce not in {"mean", "max"}:
             raise ValueError(f"Unsupported reduce={reduce!r}; expected 'mean' or 'max'")
 
-        jT, jH, jW = self.jepa_grid
+        # Use actual tensor shape for JEPA dims (config is fixed at 16-frame window,
+        # but full-stream can produce larger temporal grids)
+        jT, jH, jW = values.shape[-3:]
         qT, qH, qW = self.qwen_llm_grid(video_grid_thw)
 
         if (jT, jH, jW) == (qT, qH, qW):
@@ -250,12 +251,11 @@ class TokenMapper:
                 return grouped.mean(dim=reduce_dims)
             return grouped.amax(dim=reduce_dims)
 
-        # Fallback for future grids that are not exact integer downsampling of JEPA.
-        mode = "trilinear"
+        # Trilinear interpolation for non-integer ratios
         resized = F.interpolate(
             values.unsqueeze(1),
             size=(qT, qH, qW),
-            mode=mode,
+            mode="trilinear",
             align_corners=False,
         ).squeeze(1)
         return resized
@@ -264,9 +264,12 @@ class TokenMapper:
         if value.ndim == 3:
             value = value.unsqueeze(0)
         if value.ndim != 4:
-            raise ValueError(f"Expected {name} [B,8,16,16] or [8,16,16], got {tuple(value.shape)}")
-        if tuple(value.shape[-3:]) != self.jepa_grid:
-            raise ValueError(f"Expected {name} trailing shape {self.jepa_grid}, got {tuple(value.shape[-3:])}")
+            raise ValueError(f"Expected {name} [B,T,16,16] or [T,16,16], got {tuple(value.shape)}")
+        # Spatial dims must match 16x16; temporal dim is flexible for full-stream
+        if tuple(value.shape[-2:]) != self.jepa_grid[1:]:
+            raise ValueError(
+                f"Expected {name} spatial shape {self.jepa_grid[1:]}, got {tuple(value.shape[-2:])}"
+            )
         return value
 
     def _topk_with_cell_coverage(
