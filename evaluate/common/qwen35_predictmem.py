@@ -179,20 +179,25 @@ def build_video_inputs_for_eval(
     std = torch.tensor(IMAGENET_STD, device=jepa_01.device).view(1, 3, 1, 1)
     predictmem_frames_256 = ((jepa_01 - mean) / std).contiguous().cpu()
 
+    # Processor-safe metadata (only keys Qwen's VideoMetadata expects)
     video_metadata = {
         "total_num_frames": total_1fps,
         "fps": float(fps),
         "duration": clip_duration,
         "frames_indices": source_indices,
-        "clip_start": clip_start,
-        "clip_end": clip_end,
-        "source_fps": source_fps,
         "height": qwen_size,
         "width": qwen_size,
         "video_backend": "decord",
     }
 
-    return qwen_frames_uint8, predictmem_frames_256, video_metadata
+    # Extended metadata for logging / traceability (not passed to processor)
+    extra_meta = {
+        "clip_start": clip_start,
+        "clip_end": clip_end,
+        "source_fps": source_fps,
+    }
+
+    return qwen_frames_uint8, predictmem_frames_256, video_metadata, extra_meta
 
 
 # ── Chat / Generation ──────────────────────────────────────────────────────

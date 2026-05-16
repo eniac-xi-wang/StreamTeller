@@ -139,7 +139,7 @@ mkdir -p "${RESULT_DIR}"
 export PYTHONPATH="${REPO_ROOT}:${LOCAL_MODELS_DIR}:${VJEPA_SRC}:${PYTHONPATH:-}"
 
 GIT_COMMIT=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-GIT_STATUS=$(git -C "${REPO_ROOT}" status --short 2>/dev/null | head -5 || echo "unknown")
+GIT_STATUS=$(git -C "${REPO_ROOT}" status --short 2>/dev/null | head -5 | tr '\n' ' ' || echo "unknown")
 
 # ────────────────────────────────────────────────────────────────────────────
 # Print & save config
@@ -191,7 +191,7 @@ cfg = {
     'window_frames': ${WINDOW_FRAMES},
     'stride_frames': ${STRIDE_FRAMES},
     'tail_keep_frames': ${TAIL_KEEP_FRAMES},
-    'drop_bootstrap': ${DROP_BOOTSTRAP},
+    'drop_bootstrap': '${DROP_BOOTSTRAP}' == 'true',
     'fps': ${FPS},
     'qwen_size': ${QWEN_SIZE},
     'jepa_size': ${JEPA_SIZE},
@@ -202,7 +202,7 @@ cfg = {
     'device': '${DEVICE}',
     'torch_dtype': '${TORCH_DTYPE}',
     'num_gpus': ${NUM_GPUS},
-    'disable_thinking': ${DISABLE_THINKING},
+    'disable_thinking': '${DISABLE_THINKING}' == 'true',
     'task_csv': '${TASK_CSV}',
     'video_dir': '${VIDEO_DIR}',
     'result_dir': '${RESULT_DIR}',
