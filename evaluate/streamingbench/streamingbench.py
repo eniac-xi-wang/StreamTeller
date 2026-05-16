@@ -136,7 +136,18 @@ def run_single(args):
     logger.info(f"StreamingBench: run_name={args.run_name}, method={args.method}")
     logger.info(f"model={args.model_path}, task_csv={args.task_csv}, video_dir={args.video_dir}")
 
-    model = load_qwen35_model(args.model_path, "cuda")
+    model = load_qwen35_model(
+        args.model_path,
+        device=getattr(args, "device", "cuda"),
+        torch_dtype=getattr(args, "torch_dtype", "bfloat16"),
+        jepa_checkpoint_path=getattr(args, "jepa_checkpoint_path", None),
+        vjepa_src_path=getattr(args, "vjepa_src_path", None),
+        predictmem_keep_ratio=args.predictmem_keep_ratio,
+        window_frames=args.window_frames,
+        stride_frames=args.stride_frames,
+        tail_keep_frames=args.tail_keep_frames,
+        drop_bootstrap=args.drop_bootstrap,
+    )
     processor = load_qwen35_processor(args.model_path, fps=args.fps)
     logger.info(f"Model loaded")
 
@@ -163,11 +174,13 @@ def run_single(args):
             has_options = str(row.options) != "nan" and not pd.isna(row.options)
 
             try:
-                # Build video inputs
+                # Build video inputs with time-window clipping
                 qwen_frames, jepa_tensor, meta = build_video_inputs_for_eval(
                     video_path, fps=args.fps, qwen_size=args.qwen_size,
                     jepa_size=args.jepa_size,
                     frame_budget=args.max_num_frames,
+                    start_time=start_time,
+                    end_time=timestamp_sec,
                 )
 
                 response, stats = generate_qwen35_response(
@@ -251,8 +264,22 @@ def run_multi_gpu(args):
             "--fps", str(args.fps),
             "--max_num_frames", str(args.max_num_frames),
             "--max_new_tokens", str(args.max_new_tokens),
+            "--window_frames", str(args.window_frames),
+            "--stride_frames", str(args.stride_frames),
+            "--tail_keep_frames", str(args.tail_keep_frames),
+            "--max_pixels", str(args.max_pixels),
+            "--device", getattr(args, "device", "cuda"),
+            "--torch_dtype", getattr(args, "torch_dtype", "bfloat16"),
             "--worker",
         ]
+        if args.drop_bootstrap:
+            cmd.append("--drop_bootstrap")
+        else:
+            cmd.append("--no_drop_bootstrap")
+        if getattr(args, "jepa_checkpoint_path", None):
+            cmd += ["--jepa_checkpoint_path", args.jepa_checkpoint_path]
+        if getattr(args, "vjepa_src_path", None):
+            cmd += ["--vjepa_src_path", args.vjepa_src_path]
         if args.time_window_size is not None:
             cmd += ["--time_window_size", str(args.time_window_size)]
 
@@ -290,21 +317,37 @@ def run_multi_gpu(args):
 
 def build_parser():
     p = argparse.ArgumentParser(description="StreamingBench evaluation for Qwen3.5 + PredictMem")
+    # Paths
     p.add_argument("--model_path", default="/data/model_weights_public/Qwen/Qwen3.5-9B")
     p.add_argument("--task_csv", default=None)
     p.add_argument("--video_dir", default=None)
     p.add_argument("--run_name", default="streamingbench_run")
     p.add_argument("--result_dir", default=None)
+    p.add_argument("--jepa_checkpoint_path", default=None, help="V-JEPA checkpoint path")
+    p.add_argument("--vjepa_src_path", default=None, help="V-JEPA source code path")
+    # Method
     p.add_argument("--method", choices=["baseline", "predictmem"], default="baseline")
     p.add_argument("--predictmem_runtime", choices=["plugin", "none"], default="none")
     p.add_argument("--predictmem_keep_ratio", type=float, default=0.10)
+    # PredictMem / V-JEPA params
+    p.add_argument("--window_frames", type=int, default=16)
+    p.add_argument("--stride_frames", type=int, default=2)
+    p.add_argument("--tail_keep_frames", type=int, default=4)
+    p.add_argument("--drop_bootstrap", action="store_true", default=True)
+    p.add_argument("--no_drop_bootstrap", dest="drop_bootstrap", action="store_false")
+    # Video sampling
     p.add_argument("--fps", type=float, default=1.0)
     p.add_argument("--qwen_size", type=int, default=512)
     p.add_argument("--jepa_size", type=int, default=256)
     p.add_argument("--max_new_tokens", type=int, default=128)
     p.add_argument("--max_num_frames", type=int, default=256)
-    p.add_argument("--max_pixels", type=int, default=256 * 28 * 28)
+    p.add_argument("--max_pixels", type=int, default=200704)  # 256*28*28
     p.add_argument("--time_window_size", type=float, default=None)
+    # Generation
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--torch_dtype", default="bfloat16")
+    p.add_argument("--disable_thinking", action="store_true", default=True)
+    # Multi-GPU
     p.add_argument("--multi_gpu", action="store_true")
     p.add_argument("--num_gpus", type=int, default=1)
     p.add_argument("--dry_run", action="store_true")

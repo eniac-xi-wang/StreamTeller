@@ -311,62 +311,26 @@ def main():
         try:
             prompt_text, task_type, gt_letter = build_ovo_prompt(sample)
 
-            # ── Plugin path: build_predictmem_video_inputs ──
+            # ── Video loading: always use build_predictmem_video_inputs ──
+            # Produces Qwen 512px frames (uint8) + V-JEPA 256px tensor (ImageNet normalized).
+            # For baseline/random/uniform we discard the V-JEPA tensor.
             predictmem_frames_256 = None
             predictmem_stats = None
 
+            qwen_frames, jepa_tensor, _ = build_predictmem_video_inputs(
+                sample["video_path"],
+                fps=config.fps,
+                qwen_size=config.qwen_size,
+                jepa_size=config.jepa_size,
+                num_frames=args.frame_budget if args.frame_budget > 0 else None,
+            )
+            num_frames_np = qwen_frames.shape[0]
+
             if predictmem_runtime == "plugin" and args.method == "predictmem":
-                qwen_frames, predictmem_frames_256, video_metadata = build_predictmem_video_inputs(
-                    sample["video_path"],
-                    fps=config.fps,
-                    qwen_size=config.qwen_size,
-                    jepa_size=config.jepa_size,
-                    num_frames=args.frame_budget if args.frame_budget > 0 else None,
-                )
-                num_frames_np = qwen_frames.shape[0]
+                predictmem_frames_256 = jepa_tensor
                 print(f"  Plugin video: {num_frames_np} frames, "
                       f"jepa_tensor={list(predictmem_frames_256.shape)}")
             else:
-                # Non-predictmem or legacy: just use decord for Qwen frames
-                import decord
-                decord.bridge.set_bridge("torch")
-                vr = decord.VideoReader(sample["video_path"])
-                total_frames = len(vr)
-                source_fps = float(vr.get_avg_fps() or config.fps)
-                duration = total_frames / source_fps if source_fps > 0 else 0.0
-                total_1fps = max(1, int(duration * config.fps))
-
-                if args.stream_mode == "full":
-                    if args.frame_budget > 0:
-                        total_1fps = min(args.frame_budget, total_1fps)
-                    times_s = [i / config.fps for i in range(total_1fps)]
-                elif args.stream_mode == "tail_budget":
-                    budget = args.frame_budget or 64
-                    total_1fps = min(budget, total_1fps)
-                    start_s = max(0.0, duration - total_1fps / config.fps)
-                    times_s = [start_s + i / config.fps for i in range(total_1fps)]
-                elif args.stream_mode == "first_budget":
-                    budget = args.frame_budget or 64
-                    total_1fps = min(budget, total_1fps)
-                    times_s = [i / config.fps for i in range(total_1fps)]
-                elif args.stream_mode == "uniform_budget":
-                    budget = args.frame_budget or 64
-                    total_1fps = min(budget, total_1fps)
-                    times_s = [i * duration / total_1fps for i in range(total_1fps)]
-                else:
-                    times_s = [i / config.fps for i in range(total_1fps)]
-
-                source_indices = [
-                    min(total_frames - 1, max(0, int(round(t * source_fps))))
-                    for t in times_s
-                ]
-                frames_raw = vr.get_batch(source_indices)
-                if hasattr(frames_raw, "asnumpy"):
-                    frames_raw = frames_raw.asnumpy()
-                elif isinstance(frames_raw, torch.Tensor):
-                    frames_raw = frames_raw.numpy()
-                qwen_frames = np.asarray(frames_raw, dtype=np.uint8)
-                num_frames_np = qwen_frames.shape[0]
                 print(f"  Frames: {num_frames_np}")
 
             # ── Visual ablation ──
@@ -462,6 +426,10 @@ def main():
             # Collect PredictMem plugin stats
             pm_stats = getattr(getattr(model, "model", None), "predictmem_last_stats", None)
 
+            # Compute derived latency fields
+            vjepa_latency = pm_stats.get("predictmem_scoring_latency_s", 0.0) if pm_stats else 0.0
+            qwen_only_latency = total_latency - vjepa_latency
+
             # ── Parse and score ──
             num_options = len(sample.get("options", []))
             parsed_response = parse_response(raw_response, task, num_options)
@@ -489,10 +457,12 @@ def main():
                 "video_grid_thw": video_grid_thw.tolist(),
                 "expected_video_tokens": num_qwen_video_tokens,
                 "keep_ratio_target": config.keep_ratio,
+                "total_latency_s": round(total_latency, 4),
+                "predictmem_scoring_latency_s": round(vjepa_latency, 4),
+                "qwen_latency_excluding_vjepa_s": round(qwen_only_latency, 4),
+                "peak_memory_mb": round(peak_memory, 1),
                 "visual_ablation": args.visual_ablation,
                 "disable_thinking": args.disable_thinking,
-                "total_latency_s": round(total_latency, 4),
-                "peak_memory_mb": round(peak_memory, 1),
             }
             if pm_stats is not None:
                 entry["predictmem_stats"] = pm_stats
