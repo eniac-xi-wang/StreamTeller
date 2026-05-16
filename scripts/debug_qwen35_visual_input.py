@@ -25,13 +25,12 @@ for _path in (_repo_root, _models_dir):
         sys.path.insert(0, str(_path))
 
 from predictmem.config import PredictMemConfig
+from predictmem.frame_plan import build_frame_plan
 from scripts.run_predictmem_ovobench import (
     build_ovo_prompt,
-    get_window_bounds,
     load_qwen35_model,
     load_qwen35_processor,
     move_inputs_to_device,
-    sample_window,
 )
 
 
@@ -87,17 +86,30 @@ def main():
     sample = load_sample(args.bench_path, args.video_dir, args.sample_id)
     processor = load_qwen35_processor(args.model_path, args.fps)
     prompt, task, gt = build_ovo_prompt(sample)
-    window_start_s, window_end_s, video_duration_s = get_window_bounds(
+
+    # Build FramePlan — shared by Qwen and V-JEPA
+    if args.window_policy == "full_stream":
+        stream_mode = "full"
+        frame_budget = args.max_stream_frames
+    elif args.window_policy == "anchor_end16":
+        stream_mode = "tail_budget"
+        frame_budget = args.num_frames
+    else:
+        stream_mode = "first_budget"
+        frame_budget = args.num_frames
+
+    frame_plan = build_frame_plan(
         sample["video_path"],
-        args.window_policy,
-        config.window_frames / config.fps,
-        args.fps,
-        args.max_stream_frames,
+        stream_mode=stream_mode,
+        frame_budget=frame_budget,
+        target_fps=args.fps,
+        qwen_size=args.qwen_size,
+        vjepa_size=config.jepa_size,
     )
-    video_sample, actual_start_s, actual_end_s = sample_window(
-        sample["video_path"], window_start_s, window_end_s, config
-    )
-    frames_np = video_sample.frames_uint8
+    frames_np = frame_plan.qwen_frames_uint8
+    actual_start_s = frame_plan.frame_plan_start_s
+    actual_end_s = frame_plan.frame_plan_end_s_exclusive
+    video_duration_s = frame_plan.video_duration_s
 
     messages = [
         {
@@ -151,8 +163,10 @@ def main():
         "window_end_s": actual_end_s,
         "video_duration_s": video_duration_s,
         "num_frames": int(frames_np.shape[0]),
-        "source_indices_head": video_sample.source_indices[:4],
-        "source_indices_tail": video_sample.source_indices[-4:],
+        "source_indices_head": frame_plan.source_indices[:4],
+        "source_indices_tail": frame_plan.source_indices[-4:],
+        "frame_plan_num_frames": frame_plan.num_frames,
+        "frame_plan_truncated": frame_plan.truncated,
         "video_grid_thw": video_grid_thw.tolist(),
         "pixel_values_videos_shape": list(inputs["pixel_values_videos"].shape),
         "input_ids_shape": list(inputs["input_ids"].shape),
