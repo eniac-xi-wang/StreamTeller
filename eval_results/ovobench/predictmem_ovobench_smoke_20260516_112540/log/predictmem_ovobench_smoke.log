@@ -1,0 +1,6 @@
+2026-05-16 11:25:40,000 | INFO | OVO-Bench: run_name=predictmem_ovobench_smoke, method=predictmem
+2026-05-16 11:25:40,000 | INFO | model_path=/data/model_weights_public/Qwen/Qwen3.5-9B, result_dir=eval_results/ovobench/predictmem_ovobench_smoke_20260516_112540
+2026-05-16 11:25:42,829 | WARNING | The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+2026-05-16 11:27:56,445 | INFO | Model loaded: 9.4B params
+2026-05-16 11:27:56,450 | INFO | Processing 2 samples
+2026-05-16 11:30:35,271 | INFO | Done. Output: eval_results/ovobench/predictmem_ovobench_smoke_20260516_112540/outputs/predictmem_ovobench_smoke.jsonl
