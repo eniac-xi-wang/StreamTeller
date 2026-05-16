@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 """Real Qwen3.5 evaluator for PredictMem on OVO-Bench.
 
-Loads Qwen3.5-9B, samples videos per window policy, and runs four methods
-(baseline, random, uniform, predictmem) with real model.generate().
+Uses a shared FramePlan so Qwen and V-JEPA always operate on the same frames.
+Supports four stream modes and one-shot single-window policies.
 
-Window policies:
-  - first16:      First 16s window (debug only)
-  - anchor_end16: Last 16s window (default smoke — question likely near end)
-  - full_stream:  Sliding V-JEPA windows over full chunk, one final answer
+Stream modes:
+  - full:              Read entire chunk (default for experiments)
+  - tail_budget:       Last N frames (ablation only)
+  - uniform_budget:    N frames uniformly spaced (low-cost approximation)
+  - first_budget:      First N frames (debug only)
+
+Window policies (single-window, for prompt/scoring smoke):
+  - anchor_end16:      Last 16 frames of target section
+  - first16:           First 16 frames (debug only)
 
 Usage:
-    # Prompt/scoring smoke
+    # Full-stream baseline on sample 0
     python scripts/run_predictmem_ovobench.py \
         --model_path /data/model_weights_public/Qwen/Qwen3.5-9B \
-        --method baseline --window_policy anchor_end16 \
-        --max_samples 5 --max_new_tokens 8 \
-        --output results/prompt_smoke_baseline_5.jsonl --device cuda
+        --method baseline --stream_mode full \
+        --max_samples 1 --disable_thinking --max_new_tokens 16 \
+        --output results/debug_full_baseline_sample0.jsonl --device cuda
 
-    # Full-stream PredictMem smoke
+    # Full-stream PredictMem on sample 0
     python scripts/run_predictmem_ovobench.py \
         --model_path /data/model_weights_public/Qwen/Qwen3.5-9B \
-        --method predictmem --window_policy full_stream \
-        --cache_path results/predictmem_scores_stream_5.jsonl \
-        --max_samples 5 --max_stream_frames 64 --keep_ratio 0.5 \
-        --max_new_tokens 8 --output results/fullstream_predictmem_5.jsonl --device cuda
+        --method predictmem --stream_mode full \
+        --cache_path results/predictmem_scores_full_sample0.jsonl \
+        --max_samples 1 --keep_ratio 0.5 --disable_thinking \
+        --max_new_tokens 16 \
+        --output results/debug_full_predictmem_sample0.jsonl --device cuda
 """
 
 import argparse
@@ -45,15 +51,13 @@ for _path in (_repo_root, _models_dir):
 from predictmem.config import PredictMemConfig
 from predictmem.token_mapping import TokenMapper
 from predictmem.cache import ScoreCache
+from predictmem.frame_plan import FramePlan, build_frame_plan
 from predictmem.video_sampling import sample_video_1fps_decord
 
 
 # ─── OVO Prompt Builder ─────────────────────────────────────────────────────
 
-# Task types that use multiple-choice prompt
 _MC_TASKS = {"EPM", "ASI", "HLD", "STU", "OJR", "ATR", "ACR", "OCR", "FPD"}
-
-# Task types with special output format
 _YESNO_TASKS = {"SSR", "CRR"}
 _NUMBER_TASKS = {"REC"}
 
@@ -63,13 +67,7 @@ def _option_letter(idx: int) -> str:
 
 
 def build_ovo_prompt(sample: dict) -> tuple[str, str, str]:
-    """Build OVO-format prompt. Returns (prompt_text, task, ground_truth_letter).
-
-    ground_truth_letter is the expected answer format:
-      - "A"/"B"/"C"/"D" for multiple-choice
-      - "Yes"/"No" for SSR/CRR
-      - number string for REC
-    """
+    """Build OVO-format prompt. Returns (prompt_text, task, ground_truth_letter)."""
     task = sample["task"]
     question = sample.get("question", "")
     options = sample.get("options", [])
@@ -98,7 +96,6 @@ def build_ovo_prompt(sample: dict) -> tuple[str, str, str]:
                 f"Do not include any additional text or explanation in your response."
             )
         else:
-            # SSR without question: construct from test_info
             test_info = sample.get("test_info", [])
             if test_info:
                 ti = test_info[0]
@@ -111,7 +108,6 @@ def build_ovo_prompt(sample: dict) -> tuple[str, str, str]:
                 )
             else:
                 prompt = "Respond only with Yes or No."
-        # Determine ground truth: for SSR type=1 -> Yes, type=0 -> No
         gt_letter = ""
         if answer:
             gt_letter = "Yes" if "yes" in answer.lower() else answer
@@ -127,7 +123,6 @@ def build_ovo_prompt(sample: dict) -> tuple[str, str, str]:
             f"Respond only with a number.\n"
             f"Do not include any additional text or explanation in your response."
         )
-        # Ground truth: extract count from test_info
         gt_letter = ""
         test_info = sample.get("test_info", [])
         if test_info:
@@ -135,12 +130,8 @@ def build_ovo_prompt(sample: dict) -> tuple[str, str, str]:
         return prompt, task, gt_letter
 
     else:
-        # Fallback: direct question
         if question:
-            prompt = (
-                f"Question: {question}\n\n"
-                f"Answer concisely in a few words."
-            )
+            prompt = f"Question: {question}\n\nAnswer concisely in a few words."
         else:
             prompt = "Describe what is happening in the video."
         gt_letter = answer
@@ -150,16 +141,13 @@ def build_ovo_prompt(sample: dict) -> tuple[str, str, str]:
 # ─── Response Parser ─────────────────────────────────────────────────────────
 
 def parse_response(raw_response: str, task: str, num_options: int = 0) -> str:
-    """Parse model output into a canonical format: letter, Yes/No, or number."""
+    """Parse model output into canonical format: letter, Yes/No, or number."""
     cleaned = raw_response.strip()
 
     if task in _MC_TASKS and num_options > 0:
-        # Try to extract a single letter
         letter_match = re.search(r'\b([A-D])\b', cleaned, re.IGNORECASE)
         if letter_match:
             return letter_match.group(1).upper()
-
-        # Try to match option text to a letter
         return ""
 
     elif task in _YESNO_TASKS:
@@ -170,7 +158,6 @@ def parse_response(raw_response: str, task: str, num_options: int = 0) -> str:
         elif no_match and not yes_match:
             return "No"
         elif yes_match and no_match:
-            # Both found, pick the first
             return "Yes" if yes_match.start() < no_match.start() else "No"
         return ""
 
@@ -196,7 +183,6 @@ def score_parsed_response(parsed: str, ground_truth_letter: str, task: str) -> i
     elif task in _NUMBER_TASKS:
         return 1 if parsed.strip() == ground_truth_letter.strip() else 0
     else:
-        # Substring match for open-ended
         npred = " ".join(parsed.lower().split())
         ngt = " ".join(ground_truth_letter.lower().split())
         return 1 if ngt and npred and ngt in npred else 0
@@ -239,18 +225,8 @@ def move_inputs_to_device(inputs: dict, device: str) -> dict:
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
 
-def decode_new_tokens(processor, generated_ids: torch.Tensor, input_len: int) -> str:
-    output_ids = generated_ids[0, input_len:]
-    if hasattr(processor, "decode"):
-        return processor.decode(output_ids, skip_special_tokens=True)
-    return processor.tokenizer.decode(output_ids, skip_special_tokens=True)
-
-
 def apply_chat_template_for_generation(processor, messages, disable_thinking: bool) -> str:
-    kwargs = {
-        "tokenize": False,
-        "add_generation_prompt": True,
-    }
+    kwargs = {"tokenize": False, "add_generation_prompt": True}
     if disable_thinking:
         kwargs["enable_thinking"] = False
     try:
@@ -260,66 +236,166 @@ def apply_chat_template_for_generation(processor, messages, disable_thinking: bo
         return processor.apply_chat_template(messages, **kwargs)
 
 
-# ─── Window Policy ───────────────────────────────────────────────────────────
+def decode_new_tokens(processor, generated_ids: torch.Tensor, input_len: int) -> str:
+    output_ids = generated_ids[0, input_len:]
+    if hasattr(processor, "decode"):
+        return processor.decode(output_ids, skip_special_tokens=True)
+    return processor.tokenizer.decode(output_ids, skip_special_tokens=True)
 
-def get_window_bounds(video_path: str, policy: str, window_size_s: float,
-                       fps: float, max_stream_frames: int,
-                       stream_anchor: str = "end") -> tuple[float, float, float]:
-    """Return (start_time_s, end_time_s, video_duration_s) for the given policy.
 
-    When policy='full_stream' and max_stream_frames limits the budget,
-    stream_anchor controls which part of the chunk is covered:
-      - start:  beginning of video
-      - end:    end of video (default for OVO)
-      - uniform: spaced across full duration
+# ─── V-JEPA Scoring (FramePlan-based) ────────────────────────────────────────
+
+def score_vjepa_windows(
+    frame_plan: FramePlan,
+    config: PredictMemConfig,
+    cache: ScoreCache,
+    sample_id: str,
+    device: str,
+    score_mode: str = "online_latest_tubelet",
+) -> tuple[torch.Tensor, float, list[dict]]:
+    """Run V-JEPA sliding-window scoring over a FramePlan.
+
+    Args:
+        frame_plan: shared sampling plan
+        config: PredictMemConfig
+        cache: ScoreCache for window-level results
+        sample_id: OVO sample id
+        device: cuda device
+        score_mode: ``online_latest_tubelet`` (14→2) or ``offline_all_tubelets``
+
+    Returns:
+        (global_scores, cache_build_latency_s, window_debug_list)
+        global_scores: [num_tubelets, 16, 16] mean-aggregated losses
     """
-    import decord
-    decord.bridge.set_bridge("torch")
-    vr = decord.VideoReader(str(video_path))
-    total_frames = len(vr)
-    source_fps = float(vr.get_avg_fps() or fps)
-    duration = total_frames / source_fps if source_fps > 0 else 0
+    from predictmem.vjepa_scorer import VJEPAPredictLossScorer, make_vjepa_encoder_predictor
 
-    if policy == "first16":
-        start = 0.0
-        end = min(window_size_s, duration)
-    elif policy == "anchor_end16":
-        end = duration
-        start = max(0.0, duration - window_size_s)
-    elif policy == "full_stream":
-        budget_s = max_stream_frames / fps if max_stream_frames else duration
-        if budget_s >= duration:
-            start, end = 0.0, duration
-        elif stream_anchor == "end":
-            end = duration
-            start = max(0.0, duration - budget_s)
-        elif stream_anchor == "uniform":
-            # Spread budget across the full duration: take frames at uniform intervals
-            start = 0.0
-            end = duration
-        else:
-            start = 0.0
-            end = min(duration, budget_s)
-    else:
-        raise ValueError(f"Unknown window_policy: {policy}")
-
-    return start, end, duration
-
-
-def sample_window(video_path: str, start_s: float, end_s: float, config: PredictMemConfig):
-    """Sample frames from [start_s, end_s] at 1FPS.
-
-    Returns (DecordVideoSample, actual_start_s, actual_end_s).
-    The number of frames is determined by the time window: ceil((end-start) * fps).
-    For fixed 16-frame policies, uses config.window_frames.
-    """
-    num_frames = max(1, int((end_s - start_s) * config.fps))
-    sample = sample_video_1fps_decord(
-        video_path, num_frames=num_frames, size=config.qwen_size,
-        target_fps=config.fps, start_time_s=start_s,
+    checkpoint = "/data/model_weights_public/jepa/jeap_vitl_16_256.pt"
+    models = make_vjepa_encoder_predictor(checkpoint_path=checkpoint, device=device)
+    scorer = VJEPAPredictLossScorer(
+        config, models["context_encoder"], models["target_encoder"],
+        models["predictor"], degraded=models["degraded"],
     )
-    actual_end = start_s + num_frames / config.fps
-    return sample, start_s, actual_end
+
+    window_frames = config.window_frames  # 16
+    stride_frames = config.temporal_stride  # 2
+
+    num_tubelets = frame_plan.num_tubelets
+    global_loss_sum = torch.zeros(num_tubelets, 16, 16)
+    global_loss_count = torch.zeros(num_tubelets, 16, 16)
+
+    t0 = time.perf_counter()
+    window_debug: list[dict] = []
+
+    for local_start in frame_plan.window_starts(window_frames, stride_frames):
+        bounds = frame_plan.window_bounds(local_start, window_frames)
+        if len(bounds["source_indices"]) != window_frames:
+            continue
+
+        # Use cache if available
+        cache_key = _make_cache_key(
+            sample_id, frame_plan.stream_mode, frame_plan.frame_budget,
+            frame_plan.frame_plan_start_s, local_start, window_frames,
+            stride_frames, score_mode,
+        )
+        if cache.has(cache_key):
+            loss_map = cache.get_loss_map(cache_key)
+            if loss_map is not None:
+                _accumulate_loss(global_loss_sum, global_loss_count, loss_map, local_start, score_mode)
+                window_debug.append({"local_start": local_start, "cached": True, **bounds})
+                continue
+
+        # Sample and score
+        try:
+            frames_256 = frame_plan.get_vjepa_tensor(local_start, window_frames).to(device)
+        except Exception:
+            continue
+
+        if score_mode == "online_latest_tubelet":
+            # Only score the latest (last) 2-frame tubelet for this window
+            # Context = first 14 frames, target = last 2 frames
+            new_tubelet_id = window_frames // 2 - 1  # 7 for 16-frame window
+            score = scorer.score_window_online(frames_256, new_tubelet_id=new_tubelet_id)
+        else:
+            score = scorer.score_window(frames_256)
+
+        loss_map = score.loss_map.cpu()
+        if loss_map.dim() == 4:
+            loss_map = loss_map.squeeze(0)
+
+        keep_mask = score.keep_mask.cpu()
+        if keep_mask.dim() == 4:
+            keep_mask = keep_mask.squeeze(0)
+
+        # Cache this window
+        ki = score.keep_indices[0].cpu() if score.keep_indices else None
+        cache.put(
+            cache_key, loss_map, keep_mask, ki,
+            window_id=local_start,
+            window_start_s=bounds["window_start_s"],
+            window_end_s=bounds["window_end_s_exclusive"],
+            source_indices=bounds["source_indices"],
+        )
+
+        _accumulate_loss(global_loss_sum, global_loss_count, loss_map, local_start, score_mode)
+        window_debug.append({
+            "local_start": local_start, "cached": False,
+            "loss_map_shape": list(loss_map.shape),
+            **bounds,
+        })
+
+    cache.flush()
+    t1 = time.perf_counter()
+
+    # Average overlapping windows
+    global_loss_count = global_loss_count.clamp(min=1)
+    global_scores = global_loss_sum / global_loss_count
+
+    return global_scores, t1 - t0, window_debug
+
+
+def _accumulate_loss(
+    global_loss_sum: torch.Tensor,
+    global_loss_count: torch.Tensor,
+    loss_map: torch.Tensor,
+    local_start: int,
+    score_mode: str,
+):
+    """Accumulate window loss into global tubelet scores."""
+    if score_mode == "online_latest_tubelet":
+        # loss_map is [1, 16, 16] for only the latest tubelet
+        # or [8, 16, 16] from score_window_online which returns full keep_mask
+        if loss_map.shape[0] == 1:
+            # Only the latest tubelet
+            global_t = local_start // 2 + (16 // 2 - 1)
+            if global_t < global_loss_sum.shape[0]:
+                global_loss_sum[global_t] += loss_map.squeeze(0) if loss_map.dim() == 4 else loss_map[0]
+                global_loss_count[global_t] += 1
+        else:
+            # Full 8-tubelet map from score_window_online; only use last tubelet
+            global_t = local_start // 2 + (loss_map.shape[0] - 1)
+            if global_t < global_loss_sum.shape[0]:
+                global_loss_sum[global_t] += loss_map[-1]
+                global_loss_count[global_t] += 1
+    else:
+        # offline_all_tubelets: accumulate all tubelets
+        for local_t in range(loss_map.shape[0]):
+            global_t = local_start // 2 + local_t
+            if global_t < global_loss_sum.shape[0]:
+                global_loss_sum[global_t] += loss_map[local_t]
+                global_loss_count[global_t] += 1
+
+
+def _make_cache_key(
+    sample_id: str, stream_mode: str, frame_budget: int,
+    frame_plan_start_s: float, local_window_start: int,
+    window_frames: int, stride_frames: int, score_mode: str,
+) -> str:
+    """Build a reproducible cache key from sampling parameters."""
+    return (
+        f"{sample_id}|{stream_mode}|b{frame_budget}|"
+        f"s{frame_plan_start_s:.1f}|w{local_window_start}|"
+        f"wf{window_frames}|sf{stride_frames}|{score_mode}"
+    )
 
 
 # ─── Keep Index Generators ───────────────────────────────────────────────────
@@ -327,9 +403,9 @@ def sample_window(video_path: str, start_s: float, end_s: float, config: Predict
 def generate_keep_indices_for_method(
     method: str, config: PredictMemConfig, sample_id: str,
     cache: ScoreCache | None, seed: int, video_grid_thw: torch.Tensor,
-    mapper: TokenMapper, window_id: int | None = None,
+    mapper: TokenMapper, global_scores: torch.Tensor | None = None,
 ) -> tuple[list, dict]:
-    """Generate keep_indices for one sample/window. Returns (keep_indices_list, stats)."""
+    """Generate keep_indices. Uses global_scores for predictmem full-stream."""
     num_tokens = mapper.compute_num_video_tokens(video_grid_thw)
     stats = {"original_video_tokens": num_tokens}
 
@@ -352,138 +428,27 @@ def generate_keep_indices_for_method(
         stats["keep_ratio_actual"] = len(keep[0]) / num_tokens
         stats["kept_video_tokens"] = len(keep[0])
     elif method == "predictmem":
-        if cache is None:
-            raise ValueError("Cache required for predictmem method")
-        cache_key = f"{sample_id}:{window_id}" if window_id is not None else sample_id
-        if cache.has(cache_key):
-            loss_map = cache.get_loss_map(cache_key)
-            keep_mask = None if loss_map is not None else cache.get_keep_mask(cache_key)
+        if global_scores is not None:
+            keep = mapper.map_scores_to_qwen_keep_indices(
+                video_grid_thw=video_grid_thw, loss_map=global_scores,
+                keep_mask=None, keep_ratio=config.keep_ratio,
+            )
+        elif cache is not None:
+            # Legacy single-window path
+            loss_map = cache.get_loss_map(sample_id)
+            keep_mask = None if loss_map is not None else cache.get_keep_mask(sample_id)
             keep = mapper.map_scores_to_qwen_keep_indices(
                 video_grid_thw=video_grid_thw, loss_map=loss_map,
                 keep_mask=keep_mask, keep_ratio=config.keep_ratio,
             )
-            stats["keep_ratio_actual"] = len(keep[0]) / num_tokens
-            stats["kept_video_tokens"] = len(keep[0])
         else:
-            raise ValueError(f"Cache key {cache_key} not found")
+            raise ValueError("predictmem requires cache or global_scores")
+        stats["keep_ratio_actual"] = len(keep[0]) / num_tokens
+        stats["kept_video_tokens"] = len(keep[0])
     else:
         raise ValueError(f"Unknown method: {method}")
 
     return keep, stats
-
-
-# ─── Full-stream V-JEPA Scoring ──────────────────────────────────────────────
-
-def run_full_stream_scoring(
-    video_path: str, config: PredictMemConfig, cache: ScoreCache,
-    sample_id: str, device: str, max_stream_frames: int,
-) -> tuple[torch.Tensor, float]:
-    """Run sliding-window V-JEPA scoring over the full stream.
-
-    Returns (global_scores, cache_build_latency_s).
-    global_scores shape: [global_t, 16, 16] where global_t = ceil(num_stream_frames / 2).
-    """
-    from predictmem.vjepa_scorer import VJEPAPredictLossScorer, make_vjepa_encoder_predictor
-
-    # Load V-JEPA once
-    checkpoint = "/data/model_weights_public/jepa/jeap_vitl_16_256.pt"
-    models = make_vjepa_encoder_predictor(checkpoint_path=checkpoint, device=device)
-    scorer = VJEPAPredictLossScorer(
-        config, models["context_encoder"], models["target_encoder"],
-        models["predictor"], degraded=models["degraded"],
-    )
-
-    # Read full video and determine number of 1FPS frames within limit
-    import decord
-    decord.bridge.set_bridge("torch")
-    vr = decord.VideoReader(str(video_path))
-    source_fps = float(vr.get_avg_fps() or config.fps)
-    total_duration = len(vr) / source_fps
-
-    num_stream_frames = min(max_stream_frames, int(total_duration * config.fps))
-    num_stream_frames = max(num_stream_frames, 16)  # at least one window
-
-    # Window params
-    window_size = config.window_frames  # 16
-    stride = config.temporal_stride  # 2 frames = 2 seconds
-
-    # Accumulate per-tubelet losses
-    # Each 2-second tubelet can appear in up to 8 windows
-    num_tubelets = (num_stream_frames + 1) // 2  # ceil(num_frames / 2)
-    global_loss_sum = torch.zeros(num_tubelets, 16, 16)
-    global_loss_count = torch.zeros(num_tubelets, 16, 16)
-
-    t0 = time.perf_counter()
-    num_windows = 0
-
-    for win_start_frame in range(0, num_stream_frames - window_size + 1, stride):
-        win_end_frame = win_start_frame + window_size
-        win_start_s = win_start_frame / config.fps
-        win_end_s = win_end_frame / config.fps
-
-        # Sample this window's frames at 256px for V-JEPA
-        try:
-            ws = sample_video_1fps_decord(
-                video_path, num_frames=window_size, size=config.jepa_size,
-                target_fps=config.fps, start_time_s=win_start_s,
-            )
-        except Exception:
-            continue
-
-        frames_256 = ws.vjepa_tensor().to(device)
-        score = scorer.score_window(frames_256)
-        loss_map = score.loss_map.cpu()  # [1, 8, 16, 16] or [8, 16, 16]
-
-        if loss_map.dim() == 4:
-            loss_map = loss_map.squeeze(0)
-        # loss_map: [8, 16, 16] for this window's 8 tubelets
-
-        # Map window tubelets to global tubelets
-        # Each window of 16 frames = 8 tubelets (2 frames each)
-        # Global tubelet index = (win_start_frame // 2) + local_tubelet_idx
-        base_tubelet = win_start_frame // 2
-        for local_t in range(loss_map.shape[0]):
-            global_t = base_tubelet + local_t
-            if global_t < num_tubelets:
-                global_loss_sum[global_t] += loss_map[local_t]
-                global_loss_count[global_t] += 1
-        num_windows += 1
-
-    t1 = time.perf_counter()
-    cache_build_latency = t1 - t0
-
-    # Average overlapping windows
-    global_loss_count = global_loss_count.clamp(min=1)
-    global_scores = global_loss_sum / global_loss_count
-
-    # Cache each window's scores
-    for win_start_frame in range(0, num_stream_frames - window_size + 1, stride):
-        win_id = win_start_frame // stride
-        win_start_s = win_start_frame / config.fps
-        win_end_s = (win_start_frame + window_size) / config.fps
-        cache_key = f"{sample_id}:{win_id}"
-        if not cache.has(cache_key):
-            # Re-sample and score for caching
-            try:
-                ws = sample_video_1fps_decord(
-                    video_path, num_frames=window_size, size=config.jepa_size,
-                    target_fps=config.fps, start_time_s=win_start_s,
-                )
-            except Exception:
-                continue
-            frames_256 = ws.vjepa_tensor().to(device)
-            score = scorer.score_window(frames_256)
-            lm = score.loss_map.cpu()
-            if lm.dim() == 4:
-                lm = lm.squeeze(0)
-            km = score.keep_mask.cpu()
-            if km.dim() == 4:
-                km = km.squeeze(0)
-            ki = score.keep_indices[0].cpu()
-            cache.put(cache_key, lm, km, ki)
-    cache.flush()
-
-    return global_scores, cache_build_latency, num_windows
 
 
 # ─── Sample Loading ──────────────────────────────────────────────────────────
@@ -520,21 +485,23 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new_tokens", type=int, default=8)
+    # Window / Stream mode
     parser.add_argument("--window_policy", default="anchor_end16",
-                        choices=["first16", "anchor_end16", "full_stream"])
-    parser.add_argument("--max_stream_frames", type=int, default=64)
-    parser.add_argument("--allow_dynamic_grid", action="store_true")
-    parser.add_argument("--disable_thinking", action="store_true",
-                        help="Pass enable_thinking=False to Qwen chat template when supported.")
+                        choices=["first16", "anchor_end16"],
+                        help="Single-window policy (for prompt smoke).")
+    parser.add_argument("--stream_mode", default=None,
+                        choices=["full", "tail_budget", "uniform_budget", "first_budget"],
+                        help="Multi-window stream mode. When set, overrides --window_policy "
+                             "for the full evaluation.")
+    parser.add_argument("--frame_budget", type=int, default=0,
+                        help="Max frames for budgeted stream modes (0=no limit).")
+    # Other flags
+    parser.add_argument("--disable_thinking", action="store_true")
     parser.add_argument("--visual_ablation", default="normal",
-                        choices=["normal", "black", "shuffle", "text_only"],
-                        help="Visual sensitivity ablation: normal=video as-is, "
-                             "black=all-zero frames, shuffle=random temporal order, "
-                             "text_only=no video content block.")
-    parser.add_argument("--stream_anchor", default="end",
-                        choices=["start", "end", "uniform"],
-                        help="When max_stream_frames limits the budget, which part of the "
-                             "chunk to cover. OVO smoke should use 'end'.")
+                        choices=["normal", "black", "shuffle", "text_only"])
+    parser.add_argument("--score_mode", default="online_latest_tubelet",
+                        choices=["online_latest_tubelet", "offline_all_tubelets"])
+    parser.add_argument("--allow_dynamic_grid", action="store_true")
     args = parser.parse_args()
 
     config = PredictMemConfig()
@@ -544,7 +511,9 @@ def main():
     config.qwen_size = args.qwen_size
     config.__post_init__()
 
-    window_size_s = config.window_frames / config.fps  # 16s
+    # Resolve mode: stream_mode takes precedence
+    is_stream = args.stream_mode is not None
+    stream_mode = args.stream_mode or "full"
 
     # Load model
     print(f"Loading Qwen3.5 from {args.model_path}...")
@@ -558,85 +527,134 @@ def main():
 
     # Load samples
     samples = load_ovo_samples(args.bench_path, args.max_samples, args.video_dir)
+    mode_label = f"stream_mode={stream_mode}" if is_stream else f"window_policy={args.window_policy}"
     print(f"Running {len(samples)} samples, method={args.method}, "
-          f"window_policy={args.window_policy}, max_new_tokens={args.max_new_tokens}")
+          f"{mode_label}, max_new_tokens={args.max_new_tokens}")
 
-    # Cache for predictmem
-    cache = None
-    if args.method == "predictmem":
-        cache = ScoreCache(args.cache_path)
+    cache = ScoreCache(args.cache_path) if args.method == "predictmem" else None
 
     results = []
     for i, sample in enumerate(samples):
         sid = sample["sample_id"]
         task = sample["task"]
+        seed = args.seed + i
+
         print(f"\n[{i+1}/{len(samples)}] sample_id={sid} task={task} method={args.method}")
 
-        seed = args.seed + i
         try:
             # Build OVO prompt
             prompt_text, task_type, gt_letter = build_ovo_prompt(sample)
-            print(f"  Prompt task={task_type}, gt_letter='{gt_letter}'")
-
-            # Get window bounds
-            window_start_s, window_end_s, video_duration_s = get_window_bounds(
-                sample["video_path"], args.window_policy, window_size_s,
-                args.fps, args.max_stream_frames, stream_anchor=args.stream_anchor,
-            )
-            print(f"  Window: [{window_start_s:.1f}s, {window_end_s:.1f}s] "
-                  f"/ {video_duration_s:.1f}s (policy={args.window_policy}, "
-                  f"anchor={args.stream_anchor})")
 
             cache_build_latency = 0.0
-            num_windows = 1
             global_scores = None
+            window_debug = []
+            frame_plan = None
 
-            if args.window_policy == "full_stream" and args.method == "predictmem":
-                # P4: Full-stream V-JEPA scoring with sliding windows
-                print(f"  Computing full-stream V-JEPA scores (max_frames={args.max_stream_frames})...")
-                global_scores, cache_build_latency, num_windows = run_full_stream_scoring(
-                    sample["video_path"], config, cache, sid, args.device,
-                    args.max_stream_frames,
+            if is_stream:
+                # ── Stream mode: build FramePlan ──
+                frame_plan = build_frame_plan(
+                    sample["video_path"],
+                    stream_mode=stream_mode,
+                    frame_budget=args.frame_budget,
+                    target_fps=config.fps,
+                    qwen_size=config.qwen_size,
+                    vjepa_size=config.jepa_size,
                 )
-                print(f"  Full-stream: {num_windows} windows, "
-                      f"global_scores={list(global_scores.shape)}, "
-                      f"cache_lat={cache_build_latency:.2f}s")
+                plan_info = frame_plan.to_dict()
+                print(f"  FramePlan: {plan_info['frame_plan_num_frames']} frames, "
+                      f"[{plan_info['frame_plan_start_s']:.0f}s, {plan_info['frame_plan_end_s_exclusive']:.0f}s), "
+                      f"tubelets={plan_info['num_tubelets']}, "
+                      f"truncated={plan_info['full_stream_truncated']}")
 
-            # Sample video frames for Qwen
-            video_sample, actual_start, actual_end = sample_window(
-                sample["video_path"], window_start_s, window_end_s, config,
-            )
-            frames_np = video_sample.frames_uint8
-            print(f"  Frames: {frames_np.shape[0]} frames, "
-                  f"indices=[{video_sample.source_indices[0]}...{video_sample.source_indices[-1]}]")
+                if args.method == "predictmem":
+                    print(f"  V-JEPA scoring: mode={args.score_mode}, "
+                          f"windows={len(list(frame_plan.window_starts(16, 2)))}")
+                    global_scores, cache_build_latency, window_debug = score_vjepa_windows(
+                        frame_plan, config, cache, sid, args.device,
+                        score_mode=args.score_mode,
+                    )
+                    print(f"  Global scores: {list(global_scores.shape)}, "
+                          f"cache_lat={cache_build_latency:.1f}s")
 
-            # P3: Visual ablation — modify frames before feeding to Qwen
+                # Qwen gets all frames from the FramePlan
+                qwen_frames = frame_plan.qwen_frames_uint8
+                window_start_s = frame_plan.frame_plan_start_s
+                window_end_s = frame_plan.frame_plan_end_s_exclusive
+                video_duration_s = frame_plan.video_duration_s
+                source_indices = frame_plan.source_indices
+                num_frames_np = qwen_frames.shape[0]
+
+            else:
+                # ── Single-window mode ──
+                import decord
+                decord.bridge.set_bridge("torch")
+                vr = decord.VideoReader(sample["video_path"])
+                duration = len(vr) / (vr.get_avg_fps() or config.fps)
+
+                window_size_s = config.window_frames / config.fps
+                if args.window_policy == "anchor_end16":
+                    start_s = max(0.0, duration - window_size_s)
+                else:
+                    start_s = 0.0
+
+                ws = sample_video_1fps_decord(
+                    sample["video_path"], num_frames=config.window_frames,
+                    size=config.qwen_size, target_fps=config.fps,
+                    start_time_s=start_s,
+                )
+                qwen_frames = ws.frames_uint8
+                window_start_s = start_s
+                window_end_s = start_s + config.window_frames / config.fps
+                video_duration_s = duration
+                source_indices = ws.source_indices
+                num_frames_np = qwen_frames.shape[0]
+
+            print(f"  Frames: {num_frames_np}, "
+                  f"indices=[{source_indices[0]}...{source_indices[-1]}]")
+
+            # ── Visual ablation ──
+            frames_for_model = qwen_frames.copy()
             if args.visual_ablation == "black":
-                frames_np = np.zeros_like(frames_np)
+                frames_for_model = np.zeros_like(frames_for_model)
             elif args.visual_ablation == "shuffle":
-                perm = np.random.permutation(len(frames_np))
-                frames_np = frames_np[perm]
-            # text_only: skip adding video content block
+                perm = np.random.permutation(len(frames_for_model))
+                frames_for_model = frames_for_model[perm]
 
-            # Build messages: video + OVO prompt
+            # ── Build messages ──
             content_blocks = []
             if args.visual_ablation != "text_only":
-                content_blocks.append({"type": "video", "video": frames_np, "fps": config.fps})
+                content_blocks.append({"type": "video", "video": frames_for_model, "fps": config.fps})
             content_blocks.append({"type": "text", "text": prompt_text})
             messages = [{"role": "user", "content": content_blocks}]
 
             text = apply_chat_template_for_generation(processor, messages, args.disable_thinking)
-            inputs = processor(
-                text=[text], videos=[frames_np],
-                video_metadata=[video_sample.qwen_metadata()],
-                do_sample_frames=False, do_resize=False, fps=config.fps,
-                return_tensors="pt",
-            )
+
+            if args.visual_ablation == "text_only":
+                inputs = processor(text=[text], return_tensors="pt")
+            else:
+                # Use the original metadata from pre-sampled frames
+                video_metadata = {
+                    "total_num_frames": num_frames_np,
+                    "fps": float(config.fps),
+                    "duration": num_frames_np / float(config.fps),
+                    "frames_indices": list(range(num_frames_np)),
+                    "height": int(frames_for_model.shape[1]),
+                    "width": int(frames_for_model.shape[2]),
+                    "video_backend": "decord",
+                }
+                inputs = processor(
+                    text=[text], videos=[frames_for_model],
+                    video_metadata=[video_metadata],
+                    do_sample_frames=False, do_resize=False, fps=config.fps,
+                    return_tensors="pt",
+                )
             inputs = move_inputs_to_device(inputs, args.device)
 
             video_grid_thw = inputs["video_grid_thw"].detach().cpu()
             num_qwen_video_tokens = mapper.compute_num_video_tokens(video_grid_thw)
             print(f"  video_grid_thw: {video_grid_thw.tolist()} -> {num_qwen_video_tokens} Qwen video tokens")
+
+            # Visual debug fields
             tokenizer = processor.tokenizer
             video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
             input_ids_cpu = inputs["input_ids"][0].detach().cpu()
@@ -644,36 +662,26 @@ def main():
             mm_video_token_count = None
             if "mm_token_type_ids" in inputs:
                 mm_video_token_count = int((inputs["mm_token_type_ids"][0].detach().cpu() == 2).sum().item())
-            pixel_values_videos_shape = (
+            pvv_shape = (
                 list(inputs["pixel_values_videos"].shape) if "pixel_values_videos" in inputs else None
             )
             token_count_match = (
                 video_token_count == num_qwen_video_tokens
                 and (mm_video_token_count is None or mm_video_token_count == num_qwen_video_tokens)
-                and pixel_values_videos_shape is not None
+                and pvv_shape is not None
             )
 
-            # Generate keep indices
-            if args.window_policy == "full_stream" and args.method == "predictmem" and global_scores is not None:
-                # Use global aggregated scores for full-stream
-                keep = mapper.map_scores_to_qwen_keep_indices(
-                    video_grid_thw=video_grid_thw,
-                    loss_map=global_scores,
-                    keep_mask=None,
-                    keep_ratio=config.keep_ratio,
-                )
-            else:
-                keep, _ = generate_keep_indices_for_method(
-                    method=args.method, config=config, sample_id=sid,
-                    cache=cache, seed=seed, video_grid_thw=video_grid_thw,
-                    mapper=mapper,
-                )
-
+            # ── Generate keep indices ──
+            keep, _ = generate_keep_indices_for_method(
+                method=args.method, config=config, sample_id=sid,
+                cache=cache, seed=seed, video_grid_thw=video_grid_thw,
+                mapper=mapper, global_scores=global_scores,
+            )
             kept = keep[0].shape[0]
             keep_ratio_actual = kept / num_qwen_video_tokens
             print(f"  Keep: {kept}/{num_qwen_video_tokens} ({keep_ratio_actual:.1%})")
 
-            # Generate — single call per sample (P3)
+            # ── Generate (single call per sample) ──
             generate_kwargs = {"use_predictmem": False}
             if args.method != "baseline":
                 generate_kwargs["use_predictmem"] = True
@@ -693,17 +701,15 @@ def main():
             t1 = time.perf_counter()
             total_latency = t1 - t0
             raw_response = decode_new_tokens(processor, generated_ids, inputs["input_ids"].shape[1])
+            peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024) if args.device == "cuda" else 0.0
 
-            if args.device == "cuda":
-                peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024)
-            else:
-                peak_memory = 0.0
-
-            # Parse response
+            # ── Parse and score ──
             num_options = len(sample.get("options", []))
             parsed_response = parse_response(raw_response, task, num_options)
             score = score_parsed_response(parsed_response, gt_letter, task)
 
+            # ── Build output entry ──
+            plan_dict = frame_plan.to_dict() if frame_plan else {}
             entry = {
                 "sample_id": sid,
                 "task": task,
@@ -716,30 +722,39 @@ def main():
                 "raw_response": raw_response,
                 "score": score,
                 "method": args.method,
-                "window_policy": args.window_policy,
-                "stream_anchor": args.stream_anchor,
-                "visual_ablation": args.visual_ablation,
-                "disable_thinking": args.disable_thinking,
+                # Window / stream
+                "stream_mode": stream_mode if is_stream else "single_window",
+                "window_policy": args.window_policy if not is_stream else None,
+                "frame_budget": args.frame_budget,
+                "score_mode": args.score_mode if is_stream else None,
                 "window_start_s": round(window_start_s, 2),
-                "window_end_s": round(window_end_s, 2),
+                "window_end_s_exclusive": round(window_end_s, 2),
                 "video_duration_s": round(video_duration_s, 2),
-                "source_indices": video_sample.source_indices,
+                "source_indices": source_indices,
+                **plan_dict,
+                # Frames
                 "fps": config.fps,
-                "num_frames": frames_np.shape[0],
+                "num_frames": num_frames_np,
                 "qwen_size": config.qwen_size,
                 "video_grid_thw": video_grid_thw.tolist(),
+                # Visual debug
                 "chat_contains_video_pad": "<|video_pad|>" in text,
                 "chat_opens_thinking": text.rstrip().endswith("<think>"),
                 "chat_has_empty_think_block": "<think>\n\n</think>" in text,
                 "video_token_count": video_token_count,
                 "mm_video_token_count": mm_video_token_count,
                 "expected_video_token_count": num_qwen_video_tokens,
-                "pixel_values_videos_shape": pixel_values_videos_shape,
+                "pixel_values_videos_shape": pvv_shape,
                 "token_count_match": token_count_match,
+                # Ablation
+                "visual_ablation": args.visual_ablation,
+                "disable_thinking": args.disable_thinking,
+                # Keep
                 "keep_ratio_target": config.keep_ratio,
                 "keep_ratio_actual": round(keep_ratio_actual, 3),
                 "original_video_tokens": num_qwen_video_tokens,
                 "kept_video_tokens": kept,
+                # Latency
                 "cache_build_latency_s": round(cache_build_latency, 3),
                 "score_latency_s": 0.0,
                 "vision_latency_s": 0.0,
@@ -747,12 +762,12 @@ def main():
                 "decode_latency_s": 0.0,
                 "total_latency_s": round(total_latency, 4),
                 "peak_memory_mb": round(peak_memory, 1),
-                # Window-level debug (P3)
-                "num_sliding_windows": num_windows,
+                # Window debug (P3: per-window metadata, not answers)
+                "num_sliding_windows": len(window_debug),
             }
 
             results.append(entry)
-            print(f"  Raw: '{raw_response[:100]}'")
+            print(f"  Raw: '{raw_response.strip()}'")
             print(f"  Parsed: '{parsed_response}' | GT: '{gt_letter}' | Score: {score}")
             print(f"  Latency: {total_latency:.3f}s, Peak mem: {peak_memory:.0f}MB")
 
@@ -760,44 +775,22 @@ def main():
             print(f"  ERROR: {e}")
             import traceback
             traceback.print_exc()
-            # Build minimal error entry with OVO fields
             prompt_text, task_type, gt_letter = build_ovo_prompt(sample)
             results.append({
-                "sample_id": sid,
-                "task": task,
-                "video": sample["video_path"],
+                "sample_id": sid, "task": task, "video": sample["video_path"],
                 "question": sample.get("question", ""),
                 "answer_text": sample.get("answer", ""),
                 "ground_truth_letter": gt_letter,
                 "options": sample.get("options", []),
-                "response": f"[error: {str(e)[:100]}]",
-                "raw_response": "",
-                "score": 0,
+                "response": f"[error: {str(e)[:100]}]", "raw_response": "", "score": 0,
                 "method": args.method,
-                "window_policy": args.window_policy,
-                "stream_anchor": args.stream_anchor,
+                "stream_mode": stream_mode if is_stream else "single_window",
+                "window_policy": args.window_policy if not is_stream else None,
+                "frame_budget": args.frame_budget,
+                "score_mode": args.score_mode if is_stream else None,
+                "full_stream_truncated": False,
                 "visual_ablation": args.visual_ablation,
                 "disable_thinking": args.disable_thinking,
-                "window_start_s": 0.0,
-                "window_end_s": 0.0,
-                "video_duration_s": 0.0,
-                "source_indices": [],
-                "fps": config.fps,
-                "num_frames": 0,
-                "qwen_size": config.qwen_size,
-                "video_grid_thw": [],
-                "keep_ratio_target": config.keep_ratio,
-                "keep_ratio_actual": 0.0,
-                "original_video_tokens": 0,
-                "kept_video_tokens": 0,
-                "cache_build_latency_s": 0.0,
-                "score_latency_s": 0.0,
-                "vision_latency_s": 0.0,
-                "prefill_latency_s": 0.0,
-                "decode_latency_s": 0.0,
-                "total_latency_s": 0.0,
-                "peak_memory_mb": 0.0,
-                "num_sliding_windows": 0,
             })
 
     # Write output — one line per sample (P3)
@@ -807,7 +800,6 @@ def main():
         for r in results:
             f.write(json.dumps(r) + "\n")
     print(f"\nResults: {len(results)} entries -> {args.output}")
-    print(f"Window policy: {args.window_policy}, per-sample answers: {len(results)}")
 
 
 if __name__ == "__main__":
