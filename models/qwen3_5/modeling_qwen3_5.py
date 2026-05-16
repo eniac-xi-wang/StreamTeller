@@ -1317,6 +1317,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         self.visual = Qwen3_5VisionModel._from_config(config.vision_config)
         self.language_model = Qwen3_5TextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
+        self.predictmem = None  # set by Qwen3_5ForConditionalGeneration or external
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1625,6 +1626,8 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         mm_token_type_ids: torch.IntTensor | None = None,
         use_predictmem: bool = False,
         predictmem_keep_indices: list | None = None,
+        predictmem_frames_256: torch.Tensor | None = None,
+        predictmem_keep_ratio: float = 0.10,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5ModelOutputWithPast:
         r"""
@@ -1634,6 +1637,9 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             The temporal, height and width of feature shape of each video in LLM.
         use_predictmem (`bool`, *optional*, defaults to `False`):
             Whether to prune video placeholder tokens with PredictMem during prefill.
+        predictmem_frames_256 (`torch.Tensor`, *optional*):
+            [T, 3, 256, 256] float tensor for V-JEPA online scoring (plugin path).
+            Takes priority over ``predictmem_keep_indices`` when provided.
         predictmem_keep_indices (`list[torch.LongTensor]`, *optional*):
             Per-sample Qwen video-local token indices to keep when `use_predictmem=True`.
         """
@@ -1677,15 +1683,30 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             )
 
         # ---- PredictMem pruning ----
-        if use_predictmem and predictmem_keep_indices is not None and pixel_values_videos is not None:
-            if inputs_embeds.shape[1] > 1:  # skip during decode (seq_len == 1)
+        if use_predictmem and pixel_values_videos is not None and inputs_embeds.shape[1] > 1:
+            # Plugin path (new): model generates keep mask internally
+            if predictmem_frames_256 is not None and self.predictmem is not None:
+                (
+                    inputs_embeds, position_ids, attention_mask,
+                    predictmem_keep_indices, _stats,
+                ) = self.predictmem.process_memory_streaming(
+                    hidden_states=inputs_embeds,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    input_ids=input_ids,
+                    video_grid_thw=video_grid_thw,
+                    predictmem_frames_256=predictmem_frames_256,
+                    keep_ratio=predictmem_keep_ratio,
+                )
+            # Legacy path: externally computed keep indices
+            elif predictmem_keep_indices is not None:
                 try:
                     from ..predictmem.token_pruner import TokenPruner
                 except ImportError:
                     from predictmem.token_pruner import TokenPruner
 
                 pruner = TokenPruner(
-                    config=None,  # config not needed for pruning without keep mask generation
+                    config=None,
                     video_token_id=self.config.video_token_id,
                     vision_start_token_id=self.config.vision_start_token_id,
                     vision_end_token_id=self.config.vision_end_token_id,
@@ -1838,6 +1859,33 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
+        # PredictMem plugin (FluxMem-like, runs inside prefill)
+        try:
+            from ..predictmem.config import PredictMemConfig
+            from ..predictmem.streaming_memory import PredictMemStreamingMemory
+        except ImportError:
+            try:
+                from predictmem.config import PredictMemConfig
+                from predictmem.streaming_memory import PredictMemStreamingMemory
+            except ImportError:
+                PredictMemConfig = None
+                PredictMemStreamingMemory = None
+        if PredictMemConfig is not None and PredictMemStreamingMemory is not None:
+            try:
+                pm_config = PredictMemConfig()
+                pm_config.keep_ratio = 0.10
+                pm_config.__post_init__()
+                self.model.predictmem = PredictMemStreamingMemory(
+                    video_token_id=config.video_token_id,
+                    vision_start_token_id=config.vision_start_token_id,
+                    vision_end_token_id=config.vision_end_token_id,
+                    config=pm_config,
+                )
+            except Exception:
+                self.model.predictmem = None
+        else:
+            self.model.predictmem = None
+
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1895,6 +1943,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         use_predictmem: bool = False,
         predictmem_keep_indices: list | None = None,
+        predictmem_frames_256: torch.Tensor | None = None,
+        predictmem_keep_ratio: float = 0.10,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5CausalLMOutputWithPast:
         r"""
@@ -1961,6 +2011,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             mm_token_type_ids=mm_token_type_ids,
             use_predictmem=use_predictmem,
             predictmem_keep_indices=predictmem_keep_indices,
+            predictmem_frames_256=predictmem_frames_256,
+            predictmem_keep_ratio=predictmem_keep_ratio,
             **kwargs,
         )
 
@@ -2050,11 +2102,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if not is_first_iteration and use_cache:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
+            # Plugin path: clear predictmem frames on decode steps
+            model_inputs["predictmem_frames_256"] = None
 
         if "use_predictmem" in kwargs:
             model_inputs["use_predictmem"] = kwargs["use_predictmem"]
         if "predictmem_keep_indices" in kwargs:
             model_inputs["predictmem_keep_indices"] = kwargs["predictmem_keep_indices"]
+        if "predictmem_frames_256" in kwargs:
+            model_inputs["predictmem_frames_256"] = kwargs["predictmem_frames_256"]
+        if "predictmem_keep_ratio" in kwargs:
+            model_inputs["predictmem_keep_ratio"] = kwargs["predictmem_keep_ratio"]
 
         return model_inputs
 
