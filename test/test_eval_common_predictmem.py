@@ -96,7 +96,7 @@ def test_build_video_inputs_full_video():
         return
 
     from common.qwen35_predictmem import build_video_inputs_for_eval
-    qwen, jepa, meta = build_video_inputs_for_eval(video_path, fps=1.0, frame_budget=16)
+    qwen, jepa, meta, _extra = build_video_inputs_for_eval(video_path, fps=1.0, frame_budget=16)
 
     assert qwen.shape[0] == 16
     assert jepa.shape[0] == 16
@@ -118,10 +118,10 @@ def test_build_video_inputs_time_clip():
     from common.qwen35_predictmem import build_video_inputs_for_eval
 
     # Full: sample all at 1fps
-    _, _, full = build_video_inputs_for_eval(video_path, fps=1.0)
+    _, _, full, _ = build_video_inputs_for_eval(video_path, fps=1.0)
 
     # Clip: only first 10 seconds
-    _, _, clipped = build_video_inputs_for_eval(video_path, fps=1.0, start_time=0, end_time=10)
+    _, _, clipped, _ = build_video_inputs_for_eval(video_path, fps=1.0, start_time=0, end_time=10)
 
     # Clipped should have fewer frames (at most 10)
     assert clipped["total_num_frames"] <= full["total_num_frames"]
@@ -138,7 +138,7 @@ def test_build_video_inputs_frame_budget():
 
     from common.qwen35_predictmem import build_video_inputs_for_eval
 
-    _, _, limited = build_video_inputs_for_eval(video_path, fps=1.0, frame_budget=8)
+    _, _, limited, _ = build_video_inputs_for_eval(video_path, fps=1.0, frame_budget=8)
     assert limited["total_num_frames"] <= 8
     print(f"✓ frame_budget=8: {limited['total_num_frames']} frames")
 
@@ -152,7 +152,7 @@ def test_qwen_jepa_frame_count_match():
 
     from common.qwen35_predictmem import build_video_inputs_for_eval
 
-    qwen, jepa, _ = build_video_inputs_for_eval(video_path, fps=1.0, start_time=5, end_time=25)
+    qwen, jepa, _, _extra = build_video_inputs_for_eval(video_path, fps=1.0, start_time=5, end_time=25)
     assert qwen.shape[0] == jepa.shape[0], f"Qwen {qwen.shape[0]}, JEPA {jepa.shape[0]}"
     print(f"✓ Qwen/JEPA frame match: both {qwen.shape[0]}")
 

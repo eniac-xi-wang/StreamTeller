@@ -175,7 +175,7 @@ def run_single(args):
 
             try:
                 # Build video inputs with time-window clipping
-                qwen_frames, jepa_tensor, meta = build_video_inputs_for_eval(
+                qwen_frames, jepa_tensor, meta, _extra = build_video_inputs_for_eval(
                     video_path, fps=args.fps, qwen_size=args.qwen_size,
                     jepa_size=args.jepa_size,
                     frame_budget=args.max_num_frames,
