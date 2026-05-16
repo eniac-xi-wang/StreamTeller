@@ -1698,6 +1698,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                     predictmem_frames_256=predictmem_frames_256,
                     keep_ratio=predictmem_keep_ratio,
                 )
+                self.predictmem_last_stats = _stats
             # Legacy path: externally computed keep indices
             elif predictmem_keep_indices is not None:
                 try:

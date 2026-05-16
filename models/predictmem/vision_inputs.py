@@ -3,6 +3,9 @@
 Samples a video once and derives both Qwen 512px frames and V-JEPA 256px
 tensor from the same sampling plan.  The resulting tensors are passed
 directly to the model — ``predictmem_frames_256`` never touches disk.
+
+V-JEPA tensor receives ImageNet normalization (aligned with Survey analyzer).
+Qwen frames stay uint8 [0,255] for the Qwen processor.
 """
 
 from __future__ import annotations
@@ -10,6 +13,10 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+# ImageNet normalization (same as Survey analyzer)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def build_predictmem_video_inputs(
@@ -69,13 +76,17 @@ def build_predictmem_video_inputs(
     qwen_chw = qwen_chw.clamp(0, 255)
     qwen_frames_uint8 = qwen_chw.round().to(torch.uint8).permute(0, 2, 3, 1).contiguous().cpu().numpy()
 
-    # V-JEPA frames: resize to jepa_size, normalize to [0,1]
+    # V-JEPA frames: resize to jepa_size, apply ImageNet normalization
     if frames_chw.shape[-2:] != (jepa_size, jepa_size):
         jepa_chw = F.interpolate(frames_chw, size=(jepa_size, jepa_size),
                                   mode="bilinear", align_corners=False)
     else:
         jepa_chw = frames_chw
-    predictmem_frames_256 = (jepa_chw / 255.0).contiguous().cpu()  # [N, 3, 256, 256]
+    # Normalize to [0,1] then apply ImageNet stats (aligned with Survey analyzer)
+    jepa_01 = jepa_chw / 255.0
+    mean = torch.tensor(IMAGENET_MEAN, device=jepa_01.device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=jepa_01.device).view(1, 3, 1, 1)
+    predictmem_frames_256 = ((jepa_01 - mean) / std).contiguous().cpu()  # [N, 3, 256, 256]
 
     video_metadata = {
         "total_num_frames": total_1fps,
