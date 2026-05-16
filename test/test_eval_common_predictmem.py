@@ -1,7 +1,9 @@
-"""Tests for evaluate/common/qwen35_predictmem.py — baseline vs PredictMem kwargs, stats extraction."""
+"""Tests for evaluate/common/qwen35_predictmem.py — kwargs, stats, video clipping."""
 
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,10 +20,6 @@ from common.qwen35_predictmem import extract_predictmem_stats
 
 def test_baseline_no_predictmem_kwargs():
     """method=baseline should set use_predictmem=False and NOT pass predictmem_frames_256."""
-    # The generate_kwargs are built inside generate_qwen35_response.
-    # We test the logic directly by checking the method branch.
-    from common.qwen35_predictmem import generate_qwen35_response
-
     predictmem_runtime = "none"
     method = "baseline"
     generate_kwargs = {}
@@ -89,9 +87,84 @@ def test_stats_structure():
     print("✓ stats structure complete")
 
 
+def test_build_video_inputs_full_video():
+    """build_video_inputs_for_eval with no clip boundaries returns all frames."""
+    # Find a real video
+    video_path = "/data/qinian_workspace/OVO-Bench/chunked_videos/0.mp4"
+    if not os.path.exists(video_path):
+        print("  (skipping — no test video)")
+        return
+
+    from common.qwen35_predictmem import build_video_inputs_for_eval
+    qwen, jepa, meta = build_video_inputs_for_eval(video_path, fps=1.0, frame_budget=16)
+
+    assert qwen.shape[0] == 16
+    assert jepa.shape[0] == 16
+    assert qwen.shape[1:3] == (512, 512)
+    assert jepa.shape[1:4] == (3, 256, 256)
+    assert len(meta["frames_indices"]) == 16
+    # Source indices should increase
+    assert meta["frames_indices"][0] < meta["frames_indices"][-1]
+    print(f"✓ full video: {qwen.shape[0]} frames, source range [{meta['frames_indices'][0]}, {meta['frames_indices'][-1]}]")
+
+
+def test_build_video_inputs_time_clip():
+    """start_time/end_time should change sampled frame range."""
+    video_path = "/data/qinian_workspace/OVO-Bench/chunked_videos/0.mp4"
+    if not os.path.exists(video_path):
+        print("  (skipping — no test video)")
+        return
+
+    from common.qwen35_predictmem import build_video_inputs_for_eval
+
+    # Full: sample all at 1fps
+    _, _, full = build_video_inputs_for_eval(video_path, fps=1.0)
+
+    # Clip: only first 10 seconds
+    _, _, clipped = build_video_inputs_for_eval(video_path, fps=1.0, start_time=0, end_time=10)
+
+    # Clipped should have fewer frames (at most 10)
+    assert clipped["total_num_frames"] <= full["total_num_frames"]
+    assert clipped["duration"] <= 10.1  # allow float tolerance
+    print(f"✓ time clip: full={full['total_num_frames']} frames, clip0-10={clipped['total_num_frames']} frames")
+
+
+def test_build_video_inputs_frame_budget():
+    """frame_budget should limit total frames."""
+    video_path = "/data/qinian_workspace/OVO-Bench/chunked_videos/0.mp4"
+    if not os.path.exists(video_path):
+        print("  (skipping — no test video)")
+        return
+
+    from common.qwen35_predictmem import build_video_inputs_for_eval
+
+    _, _, limited = build_video_inputs_for_eval(video_path, fps=1.0, frame_budget=8)
+    assert limited["total_num_frames"] <= 8
+    print(f"✓ frame_budget=8: {limited['total_num_frames']} frames")
+
+
+def test_qwen_jepa_frame_count_match():
+    """Qwen and V-JEPA tensors have the same frame count."""
+    video_path = "/data/qinian_workspace/OVO-Bench/chunked_videos/0.mp4"
+    if not os.path.exists(video_path):
+        print("  (skipping — no test video)")
+        return
+
+    from common.qwen35_predictmem import build_video_inputs_for_eval
+
+    qwen, jepa, _ = build_video_inputs_for_eval(video_path, fps=1.0, start_time=5, end_time=25)
+    assert qwen.shape[0] == jepa.shape[0], f"Qwen {qwen.shape[0]}, JEPA {jepa.shape[0]}"
+    print(f"✓ Qwen/JEPA frame match: both {qwen.shape[0]}")
+
+
 if __name__ == "__main__":
     test_baseline_no_predictmem_kwargs()
     test_predictmem_plugin_kwargs()
     test_extract_predictmem_stats()
     test_stats_structure()
+    test_build_video_inputs_full_video()
+    test_build_video_inputs_time_clip()
+    test_build_video_inputs_frame_budget()
+    test_qwen_jepa_frame_count_match()
     print("\n✅ All common helper tests passed!")
+

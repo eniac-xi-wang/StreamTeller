@@ -68,12 +68,20 @@ def render_highlight_video(
                 per_frame_mask[f_idx] = mask
                 per_frame_mode[f_idx] = mode
 
-    # Load original frames
-    vr = decord.VideoReader(str(video_path))
+    # Load original frames (handle both numpy and torch decord bridges)
+    import decord as _decord
+    _decord.bridge.set_bridge("torch")
+    vr = _decord.VideoReader(str(video_path))
     native_fps = vr.get_avg_fps()
     step = max(1, int(native_fps / fps))
     frame_indices = list(range(0, len(vr), step))[:num_frames]
-    original_frames = vr.get_batch(frame_indices).asnumpy()  # RGB
+    frames_raw = vr.get_batch(frame_indices)
+    if hasattr(frames_raw, "asnumpy"):
+        original_frames = frames_raw.asnumpy()
+    elif hasattr(frames_raw, "numpy"):
+        original_frames = frames_raw.numpy()
+    else:
+        original_frames = np.asarray(frames_raw)
 
     # Generate highlight frames
     highlight_frames = []

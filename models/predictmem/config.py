@@ -23,6 +23,14 @@ class PredictMemConfig:
     score_cache_path: str | None = None
     loss_exp: float = 1.0  # exponent for V-JEPA prediction loss
 
+    # ── External dependency paths (set by bash entry) ──
+    jepa_checkpoint_path: str | None = None
+    vjepa_src_path: str | None = None
+
+    # ── Boundary policy ──
+    tail_keep_frames: int = 4  # last N frames always kept
+    drop_bootstrap: bool = True  # drop tubelet 0 (frames 0-1)
+
     # Derived properties (computed on access, not stored)
     jepa_grid_t: int = field(init=False, default=8)
     jepa_grid_h: int = field(init=False, default=16)

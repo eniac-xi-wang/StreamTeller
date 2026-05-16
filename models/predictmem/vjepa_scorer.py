@@ -382,6 +382,7 @@ def make_vjepa_analyzer_scorer(
     device: str = "cpu",
     strict_encoder: bool = False,
     strict_predictor: bool = False,
+    vjepa_src_path: str | None = None,
 ) -> dict:
     """Build V-JEPA encoders + predictor wrapped like the Survey analyzer.
 
@@ -394,7 +395,10 @@ def make_vjepa_analyzer_scorer(
         keys_found, missing_keys, unexpected_keys, num_mask_tokens, wrapper_type
     """
     import sys
-    vjepa_src = Path(__file__).parent.parent.parent / "site-packages" / "vjepa2"
+    if vjepa_src_path is not None:
+        vjepa_src = Path(vjepa_src_path)
+    else:
+        vjepa_src = Path(__file__).parent.parent.parent / "site-packages" / "vjepa2"
     if str(vjepa_src) not in sys.path:
         sys.path.insert(0, str(vjepa_src))
     from src.models import vision_transformer as vit_encoder

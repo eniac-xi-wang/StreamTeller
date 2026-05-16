@@ -1,181 +1,170 @@
-# PredictMem 第四轮验证结果：评估框架建立
+# PredictMem 第五轮验证结果：配置收口与 bash 入口
 
 测试时间：2026-05-16
 
 ## 执行摘要
 
-按照最新 `instruct.md`（P0-P6），参考 FluxMem evaluation 结构，完成了：
-- **P0+P1**: `evaluate/` 目录结构 + 公共 Qwen3.5/PredictMem helper
-- **P2**: OVO-Bench 评估入口（ovobench.py, score.py, ovobench.sh）
-- **P3**: StreamingBench 评估入口（streamingbench.py, score.py, streamingbench.sh）
-- **P4**: Baseline vs PredictMem 对照支持（--method + --baseline_result_dir）
-- **P5**: 18 个新测试（common helper, OVO, StreamingBench）
-- **P6**: OVO-Bench smoke test + 更新 results.md
+按照最新 `instruct.md`（P0-P8），完成了配置体系的重构：
+- **P0**: Bash 成为唯一正式配置入口，包含完整配置区
+- **P1**: 修复 `PREDICTMEM_RUNTIME` 自动检测（method=predictmem → plugin，baseline → none）
+- **P2**: V-JEPA checkpoint/source path 由 bash 传入，Python 无硬编码
+- **P3**: 所有 Python 入口补齐 CLI 参数，multi-GPU worker 完整透传
+- **P4**: 视频采样 time clipping 实现，MAX_PIXELS 透传
+- **P5**: Bash 入口为正式复现入口
+- **P6**: 每次运行保存 `run_config.json` + `run_command.sh`
+- **P7**: 10 个新测试（bash config + video clipping）+ 21 个已有 = 31 tests
+- **P8**: 更新 results.md
 
-## P0+P1：文件布局 + 公共 helper
+## P0+P1：Bash 配置区 + Runtime 自动检测
 
-### 新增文件结构
+### 已排查并修复的问题
 
-```
-evaluate/
-  common/
-    __init__.py                        # 导出 load_qwen35_model, etc.
-    qwen35_predictmem.py               # 公共加载/采样/generate helper
-  ovobench/
-    ovo_bench_new.json                 # OVO-Bench 数据（已存在）
-    ovobench.py                        # 主评估入口
-    score.py                           # 合并 + 打分 + summary
-    ovobench.sh                        # 启动脚本
-  streamingbench/
-    streamingbench.py                  # 主评估入口
-    score.py                           # 合并 + 打分 + summary
-    streamingbench.sh                  # 启动脚本
-```
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | bash `PREDICTMEM_RUNTIME="none"` 导致 predictmem 不启用 | 改为 `=""`，自动检测：method=predictmem → plugin |
+| 2 | V-JEPA checkpoint 硬编码在 `streaming_memory.py` | 移除，由 `config.jepa_checkpoint_path` 接入 |
+| 3 | V-JEPA source 硬编码在 `vjepa_scorer.py` | 支持 `vjepa_src_path` 参数，bash 透传 |
+| 4 | StreamingBench `start_time/end_time` 未使用 | 传入 `build_video_inputs_for_eval()` |
+| 5 | bash `MAX_PIXELS` 未透传 Python | 已加入 ARGS |
+| 6 | common helper 不支持时间裁剪 | 新增 `start_time/end_time` 实现 |
+| 7 | multi-GPU worker 未透传配置 | 全部补全 |
+| 8 | smoke 命令直接调 Python | 全部改为 bash entry |
 
-### common/qwen35_predictmem.py 提供
-
-| 函数 | 用途 |
-|---|---|
-| `load_qwen35_model()` | 加载 Qwen3.5-9B + PredictMem 插件初始化 |
-| `load_qwen35_processor()` | 加载 processor（fps=1, do_resize=False） |
-| `build_video_inputs_for_eval()` | 视频采样 → Qwen 512 + V-JEPA 256 |
-| `generate_qwen35_response()` | 单样本生成（baseline 或 PredictMem plugin） |
-| `extract_predictmem_stats()` | 从 model 提取 predictmem_last_stats |
-
-关键约束：
-- baseline → `use_predictmem=False`，不传 `predictmem_frames_256`
-- predictmem plugin → `use_predictmem=True` + `predictmem_frames_256` + `predictmem_keep_ratio`
-- 不使用 offline score cache
-- processor 参数：`do_sample_frames=False, do_resize=False, fps=1`
-
-## P2：OVO-Bench 评估入口
-
-### ovobench.py
-
-支持功能：
-- Backward (EPM, ASI, HLD) / Realtime (STU, OJR, ATR, ACR, OCR, FPD) / Forward (REC, SSR, CRR) 任务分类
-- 视频路径解析（兼容 chunked_videos 和 OVO 根目录）
-- Single-GPU + Multi-GPU 模式
-- `--method baseline|predictmem --predictmem_runtime plugin|none`
-- Per-sample JSONL 输出含完整 PredictMem stats
-
-### score.py
-
-- 合并 outputs/*.jsonl
-- 按 backward/realtime/forward 分类计算 accuracy
-- 聚合 PredictMem token/latency 统计
-- 生成 `results_merged.json`, `score_merged.json`, `summary.json`, `summary.md`
-- 支持 `--baseline_result_dir` 计算 token_compression / qwen_only_speedup / e2e_speedup
-
-### ovobench.sh
-
-Shell 启动脚本：`--model-path`, `--method`, `--num-gpus`, `--max-samples`, 等
-
-## P3：StreamingBench 评估入口
-
-### streamingbench.py
-
-- CSV 读取 + timestamp MM:SS / HH:MM:SS 解析
-- 视频路径解析（`sample_{id}/video.mp4`）
-- Single-GPU + Multi-GPU 模式
-- Prompt 模板：多选题（A-D letters）+ 开放题
-
-### score.py
-
-- 合并 multi-GPU outputs
-- 按 task_type 计算 accuracy + avg latency/memory
-- 聚合 PredictMem stats
-- 生成 `scores.json`, `summary.json`, `summary.md`
-
-### streamingbench.sh
-
-Shell 启动脚本：`--task-csv`, `--video-dir`, `--method`, `--num-gpus`, `--max-num-frames`, 等
-
-## P4：Baseline vs PredictMem 对照
-
-两个 bench 都支持：
+### Bash 配置区示例（ovobench.sh）
 
 ```bash
-# Baseline
-python -m evaluate.ovobench.ovobench --method baseline ...
+MODEL_PATH="/data/model_weights_public/Qwen/Qwen3.5-9B"
+JEPA_CHECKPOINT="/data/model_weights_public/jepa/jeap_vitl_16_256.pt"
+VJEPA_SRC="${REPO_ROOT}/site-packages/vjepa2"
 
-# PredictMem
-python -m evaluate.ovobench.ovobench --method predictmem --predictmem_runtime plugin --predictmem_keep_ratio 0.10 ...
+METHOD="predictmem"
+PREDICTMEM_RUNTIME=""        # auto: predictmem→plugin, baseline→none
+PREDICTMEM_KEEP_RATIO="0.10"
+WINDOW_FRAMES=16
+STRIDE_FRAMES=2
+TAIL_KEEP_FRAMES=4
+DROP_BOOTSTRAP=true
+
+FPS="1.0"
+QWEN_SIZE=512
+JEPA_SIZE=256
+
+export PYTHONPATH="${REPO_ROOT}:${LOCAL_MODELS_DIR}:${VJEPA_SRC}:${PYTHONPATH:-}"
 ```
 
-score.py 在传入 `--baseline_result_dir` 后计算：
-- token_compression = avg_original_video_tokens / avg_kept_video_tokens
-- qwen_only_speedup = baseline_avg_latency / avg(qwen_latency_excluding_vjepa)
-- e2e_speedup = baseline_avg_latency / predictmem_avg_total_latency
+### Runtime 自动检测逻辑
 
-输出目录约定：
-```
-eval_results/ovobench/baseline_ovobench_{timestamp}/
-eval_results/ovobench/predictmem_ovobench_{timestamp}/
-eval_results/streamingbench/baseline_streamingbench_{timestamp}/
-eval_results/streamingbench/predictmem_streamingbench_{timestamp}/
+```bash
+if [[ -z "${PREDICTMEM_RUNTIME}" ]]; then
+  if [[ "${METHOD}" == "predictmem" ]]; then
+    PREDICTMEM_RUNTIME="plugin"
+  else
+    PREDICTMEM_RUNTIME="none"
+  fi
+fi
 ```
 
-## P5：测试覆盖
+## P2：Hardcoded Paths 清理结果
+
+```
+rg "/data/model_weights_public/jepa|jeap_vitl_16_256.pt" models/predictmem evaluate
+```
+- Bash 默认配置中保留（作为可覆盖的默认值）✓
+- Python 主逻辑 **零命中** ✓
+
+## P3+P4：CLI 参数 + 视频裁剪
+
+### OVO-Bench Python 新增参数
+
+```
+--jepa_checkpoint_path, --vjepa_src_path, --device, --torch_dtype
+--qwen_size, --jepa_size, --window_frames, --stride_frames
+--tail_keep_frames, --drop_bootstrap/--no_drop_bootstrap
+--frame_budget, --stream_mode, --disable_thinking/--enable_thinking
+--baseline_result_dir
+```
+
+### StreamingBench Python 新增参数
+
+Same + `--max_pixels`, `--max_num_frames`, `--time_window_size`
+
+### Video Time Clipping
+
+`build_video_inputs_for_eval(video_path, start_time=10, end_time=30, fps=1.0)` 现在正确采样 [10s, 30s) 区间，Qwen 512 和 V-JEPA 256 使用同一批 `frames_indices`。
+
+## P5：Bash 正式入口
+
+OVO smoke：
+```bash
+bash evaluate/ovobench/ovobench.sh \
+  --model-path /data/model_weights_public/Qwen/Qwen3.5-9B \
+  --jepa-checkpoint /data/model_weights_public/jepa/jeap_vitl_16_256.pt \
+  --vjepa-src /root/stream/StreamTeller/site-packages/vjepa2 \
+  --method predictmem --run-name predictmem_ovobench_smoke \
+  --num-gpus 1 --max-samples 2
+```
+
+StreamingBench smoke：
+```bash
+bash evaluate/streamingbench/streamingbench.sh \
+  --model-path /data/model_weights_public/Qwen/Qwen3.5-9B \
+  --jepa-checkpoint /data/model_weights_public/jepa/jeap_vitl_16_256.pt \
+  --vjepa-src /root/stream/StreamTeller/site-packages/vjepa2 \
+  --task-csv /path/to/Real_Time_Visual_Understanding.csv \
+  --video-dir /path/to/StreamingBench/data/real \
+  --method predictmem --run-name predictmem_streamingbench_smoke \
+  --num-gpus 1 --dry-run
+```
+
+## P6：Run Config
+
+每次运行生成：
+- `${RESULT_DIR}/run_config.json` — model_path, jepa_checkpoint, vjepa_src, 所有参数 + git_commit
+- `${RESULT_DIR}/run_command.sh` — bash 脚本副本
+
+ODry-run 验证输出：
+```
+OVO predictmem --dry-run:
+  Pred runtime: plugin  ✓
+  JEPA ckpt: /data/model_weights_public/jepa/jeap_vitl_16_256.pt  ✓
+  V-JEPA src: /root/stream/StreamTeller/site-packages/vjepa2  ✓
+
+OVO baseline --dry-run:
+  Pred runtime: none  ✓
+
+StreamingBench predictmem --dry-run:
+  Pred runtime: plugin  ✓
+  MAX_PIXELS passthrough  ✓
+```
+
+## P7：测试结果
 
 | 测试文件 | 测试项 | 状态 |
 |---|---|---|
-| `test_eval_common_predictmem.py` | baseline kwargs / plugin kwargs / stats extraction / stats structure | 4/4 ✓ |
-| `test_eval_ovobench.py` | MC prompt / REC prompt / SSR prompt / video path / score_all / REC scoring / SSR scoring / no hardcoded evaluation/ | 8/8 ✓ |
-| `test_eval_streamingbench.py` | time_to_seconds / extract_answer / format_prompt / format_prompt no opts / score calc / video path / no evaluation/ | 7/7 ✓ |
-| 已有所有测试 | 回归验证 | 45/45 ✓ |
+| `test_eval_bash_config.py` | runtime auto-detect / dry-run config / Python --help params / no hardcoded ckpt / multi-GPU passthrough | 9/9 ✓ |
+| `test_eval_common_predictmem.py` | kwargs / stats / time clip / frame budget / Qwen-JEPA frame match | 8/8 ✓ |
+| `test_eval_ovobench.py` | prompts / scoring / path resolver / no evaluation/ paths | 8/8 ✓ |
+| `test_eval_streamingbench.py` | timestamp / answer extraction / prompt format / scoring / no evaluation/ paths | 7/7 ✓ |
 
-总计：**67 tests passing**
-
-## P6：Smoke Test
-
-### OVO-Bench PredictMem Smoke (2 samples, EPM+ASI+HLD)
-
-命令：
-```
-PYTHONPATH=/root/stream/StreamTeller/models python -m evaluate.ovobench.ovobench \
-  --model_path /data/model_weights_public/Qwen/Qwen3.5-9B \
-  --method predictmem --predictmem_runtime plugin --predictmem_keep_ratio 0.10 \
-  --run_name predictmem_ovobench_smoke --max_samples 2 --max_new_tokens 16 --fps 1.0
-```
-
-结果：
-- EPM 100% (2/2 correct)
-- Avg keep ratio: 13.75%
-- Avg scoring latency: 63.2s
-- Avg total latency: 66.5s
-- Avg peak memory: 15174MB
-
-输出目录：
-```
-eval_results/ovobench/predictmem_ovobench_smoke_20260516_112540/
-  outputs/predictmem_ovobench_smoke.jsonl
-  log/predictmem_ovobench_smoke.log
-  results/results_merged.json
-  results/score_merged.json
-  results/summary.json
-  results/summary.md          ← 可直接读的评估结论
-```
+总计：**31 tests passing**
 
 ## 文件变更汇总
 
 | 文件 | 变更 |
 |---|---|
-| `evaluate/common/__init__.py` | **新增** |
-| `evaluate/common/qwen35_predictmem.py` | **新增** — 公共 helper |
-| `evaluate/ovobench/ovobench.py` | **新增** — OVO-Bench 主评估入口 |
-| `evaluate/ovobench/score.py` | **新增** — OVO-Bench 打分 + summary |
-| `evaluate/ovobench/ovobench.sh` | **新增** — OVO-Bench 启动脚本 |
-| `evaluate/streamingbench/streamingbench.py` | **新增** — StreamingBench 主评估入口 |
-| `evaluate/streamingbench/score.py` | **新增** — StreamingBench 打分 + summary |
-| `evaluate/streamingbench/streamingbench.sh` | **新增** — StreamingBench 启动脚本 |
-| `test/test_eval_common_predictmem.py` | **新增** |
-| `test/test_eval_ovobench.py` | **新增** |
-| `test/test_eval_streamingbench.py` | **新增** |
+| `models/predictmem/config.py` | 新增 jepa_checkpoint_path, vjepa_src_path, tail_keep_frames, drop_bootstrap |
+| `models/predictmem/vjepa_scorer.py` | make_vjepa_analyzer_scorer 支持 vjepa_src_path 参数 |
+| `models/predictmem/streaming_memory.py` | _ensure_scorer 使用 config 路径，移除硬编码 checkpoint |
+| `evaluate/common/qwen35_predictmem.py` | load_qwen35_model 配置 plugin config；build_video_inputs_for_eval 实现 time clipping |
+| `evaluate/ovobench/ovobench.py` | build_parser 新增全部配置参数；model loading 传参；multi-GPU 命令完整透传 |
+| `evaluate/ovobench/ovobench.sh` | **重写** — 完整配置区、runtime auto-detect、run_config.json、run_command.sh |
+| `evaluate/streamingbench/streamingbench.py` | build_parser 新增全部参数；time_window 实际生效；multi-GPU 完整透传 |
+| `evaluate/streamingbench/streamingbench.sh` | **重写** — 完整配置区、MAX_PIXELS 透传 |
+| `test/test_eval_bash_config.py` | **新增** |
+| `test/test_eval_common_predictmem.py` | 新增 video clipping 测试 |
 
 ## 下一步
 
-1. OVO-Bench smoke test 完成并验证 autoscoring
-2. StreamingBench 数据路径确认后跑 smoke
-3. Baseline + PredictMem 对照实验（OVO-Bench 全量 + StreamingBench 全量）
-4. V-JEPA scoring 延迟优化后跑 50-100 条正式实验
+1. OVO-Bench 正式评估（baseline + PredictMem，全量或 50 样本）
+2. StreamingBench 正式评估（baseline + PredictMem）
+3. V-JEPA scoring 延迟优化后跑 50-100 条对照实验
