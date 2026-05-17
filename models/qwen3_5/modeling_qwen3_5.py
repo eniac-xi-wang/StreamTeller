@@ -1715,7 +1715,12 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                             e = s + cur_t * tpf
                             clip_pixels = pixels[s:e]
                             clip_grid = grid_thw.new_tensor([[cur_t, h, w]])
-                            outs.append(self.visual(clip_pixels, grid_thw=clip_grid))
+                            chunk_out = self.get_video_features(
+                                clip_pixels, clip_grid, return_dict=True
+                            )
+                            chunk_embeds = chunk_out.pooler_output
+                            chunk_embeds = torch.cat(chunk_embeds, dim=0) if isinstance(chunk_embeds, list) else chunk_embeds
+                            outs.append(chunk_embeds)
                         base += t * tpf
                     if len(outs) == 0:
                         return pixels.new_empty((0, self.visual.config.out_hidden_size))
@@ -2186,6 +2191,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             model_inputs["predictmem_frames_256"] = kwargs["predictmem_frames_256"]
         if "predictmem_keep_ratio" in kwargs:
             model_inputs["predictmem_keep_ratio"] = kwargs["predictmem_keep_ratio"]
+        if "video_chunk_t" in kwargs:
+            model_inputs["video_chunk_t"] = kwargs["video_chunk_t"]
+        if "compact_video_embeds" in kwargs:
+            model_inputs["compact_video_embeds"] = kwargs["compact_video_embeds"]
+        if "compact_video_position_ids" in kwargs:
+            model_inputs["compact_video_position_ids"] = kwargs["compact_video_position_ids"]
 
         return model_inputs
 
