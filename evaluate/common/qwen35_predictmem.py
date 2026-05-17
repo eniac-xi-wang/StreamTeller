@@ -30,6 +30,7 @@ def load_qwen35_model(
     stride_frames: int = 2,
     tail_keep_frames: int = 4,
     drop_bootstrap: bool = True,
+    record_keep_masks: bool = False,
 ):
     """Load Qwen3.5-9B and configure the PredictMem plugin from arguments.
 
@@ -62,6 +63,7 @@ def load_qwen35_model(
         pm.config.temporal_stride = stride_frames
         pm.config.tail_keep_frames = tail_keep_frames
         pm.config.drop_bootstrap = drop_bootstrap
+        pm.config.record_keep_masks = record_keep_masks
         pm.config.__post_init__()
 
     return model
@@ -227,6 +229,9 @@ def generate_qwen35_response(
     max_new_tokens: int = 16,
     device: str = "cuda",
     disable_thinking: bool = True,
+    video_chunk_t: int = 0,
+    compact_video_embeds: torch.Tensor | None = None,
+    compact_video_position_ids: torch.Tensor | None = None,
 ) -> tuple[str, dict]:
     """Run Qwen3.5 generation for one sample.
 
@@ -286,6 +291,12 @@ def generate_qwen35_response(
     else:
         generate_kwargs["use_predictmem"] = False
 
+    if video_chunk_t > 0:
+        generate_kwargs["video_chunk_t"] = video_chunk_t
+    if compact_video_embeds is not None:
+        generate_kwargs["compact_video_embeds"] = compact_video_embeds
+        generate_kwargs["compact_video_position_ids"] = compact_video_position_ids
+
     input_len = inputs["input_ids"].shape[1]
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -333,6 +344,174 @@ def generate_qwen35_response(
         "fps": fps,
         "num_frames": num_frames,
         "predictmem_stats": pm_stats,
+    }
+
+    return response, stats
+
+
+def generate_with_compact_memory(
+    model,
+    processor,
+    prompt: str,
+    video_path: str,
+    fps: float = 1.0,
+    frame_budget: int = 256,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+    predictmem_keep_ratio: float = 0.10,
+    max_new_tokens: int = 16,
+    device: str = "cuda",
+    disable_thinking: bool = True,
+) -> tuple[str, dict]:
+    """Run generation with compact memory — never constructs full video tokens.
+
+    The key difference from ``generate_qwen35_response``: instead of building
+    full pixel_values_videos → full visual tower → full inputs_embeds → prune,
+    this function:
+
+    1. Streams frames tubelet-by-tubelet via ``StreamingVideoSampler``.
+    2. Scores each tubelet with V-JEPA to get a keep mask.
+    3. Runs Qwen visual tower ONLY on the current tubelet.
+    4. Immediately applies the keep mask to prune embeddings.
+    5. Appends pruned embeddings to compact memory.
+    6. Assembles a minimal input sequence with only K video placeholders.
+    7. Calls the language model with ``compact_video_embeds``.
+
+    Returns:
+        (response_text, sample_stats_dict)
+    """
+    import sys
+    _models_dir = Path(__file__).parent.parent.parent / "models"
+    if str(_models_dir) not in sys.path:
+        sys.path.insert(0, str(_models_dir))
+
+    from predictmem.config import PredictMemConfig
+    from predictmem.compact_memory import PredictMemCompactMemory
+
+    # Build config from model's existing plugin config
+    pm = getattr(getattr(model, "model", None), "predictmem", None)
+    if pm is not None:
+        cfg = pm.config
+    else:
+        cfg = PredictMemConfig()
+        cfg.jepa_checkpoint_path = None  # must be set via bash
+        cfg.__post_init__()
+
+    cfg.keep_ratio = predictmem_keep_ratio
+
+    # Ingest video streaming → build compact memory
+    t0 = time.perf_counter()
+    cm = PredictMemCompactMemory(model, processor, cfg)
+    cm.ingest_video_streaming(
+        video_path, fps=fps, frame_budget=frame_budget,
+        start_time=start_time, end_time=end_time,
+        keep_ratio=predictmem_keep_ratio, device=device,
+    )
+    assembled = cm.assemble(device=device)
+    cm_stats = assembled["stats"]
+    compact_embeds = assembled["visual_embeds"]
+    compact_positions = assembled["visual_position_ids"]
+    t_compact = time.perf_counter() - t0
+
+    K = compact_embeds.shape[0]
+    if K == 0:
+        raise RuntimeError("Compact memory is empty — all tokens were pruned.")
+
+    # Build minimal input sequence: <vision_start> + K video tokens + <vision_end> + text
+    video_token_id = model.config.video_token_id
+    vision_start_id = model.config.vision_start_token_id
+    vision_end_id = model.config.vision_end_token_id
+
+    messages = [
+        {"role": "user", "content": [
+            {"type": "video", "video": None},  # placeholder — we supply embeds directly
+            {"type": "text", "text": prompt},
+        ]},
+    ]
+    text = apply_chat_template(processor, messages, disable_thinking=disable_thinking)
+
+    # Manually construct input_ids with the right number of video placeholders
+    # The template produces something like "<vision_start><video>...<video><vision_end><text>"
+    # We need to replace the video token count with K
+    input_ids_full = processor.tokenizer.encode(text, return_tensors="pt")
+    video_mask = input_ids_full[0] == video_token_id
+    num_template_video = video_mask.sum().item()
+
+    if num_template_video == 0:
+        # Fallback: construct manually
+        prefix_ids = [vision_start_id] + [video_token_id] * K + [vision_end_id]
+        text_tokens = processor.tokenizer.encode(prompt, add_special_tokens=False)
+        input_ids = torch.tensor([prefix_ids + text_tokens], dtype=torch.long, device=device)
+    elif num_template_video != K:
+        # Replace placeholder count with actual K
+        token_list = input_ids_full[0].tolist()
+        new_tokens = []
+        for tok in token_list:
+            if tok == video_token_id:
+                if not new_tokens or new_tokens[-1] != video_token_id:
+                    new_tokens.append(video_token_id)
+            else:
+                new_tokens.append(tok)
+        # Now replace the video token with K copies
+        final_tokens = []
+        for tok in new_tokens:
+            if tok == video_token_id:
+                final_tokens.extend([video_token_id] * K)
+            else:
+                final_tokens.append(tok)
+        input_ids = torch.tensor([final_tokens], dtype=torch.long, device=device)
+    else:
+        input_ids = input_ids_full.to(device)
+
+    attention_mask = torch.ones_like(input_ids, device=device)
+    inputs_embeds = model.get_input_embeddings()(input_ids)
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    t_gen0 = time.perf_counter()
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            compact_video_embeds=compact_embeds,
+            compact_video_position_ids=compact_positions,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+        )
+
+    t_gen1 = time.perf_counter()
+    total_latency = t_gen1 - t_gen0
+    peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024) if device == "cuda" else 0.0
+
+    input_len = input_ids.shape[1]
+    output_ids = generated_ids[0, input_len:]
+    if hasattr(processor, "decode"):
+        response = processor.decode(output_ids, skip_special_tokens=True)
+    else:
+        response = processor.tokenizer.decode(output_ids, skip_special_tokens=True)
+
+    stats = {
+        "total_latency_s": round(total_latency, 4),
+        "compact_build_latency_s": round(t_compact, 4),
+        "peak_memory_mb": round(peak_memory, 1),
+        "fps": fps,
+        "num_frames": cm_stats.get("num_tubelets", 0) * 2,
+        "compact_memory_tokens": K,
+        "original_video_tokens": cm_stats.get("original_video_tokens", 0),
+        "kept_video_tokens": cm_stats.get("kept_video_tokens", 0),
+        "dropped_video_tokens": cm_stats.get("dropped_video_tokens", 0),
+        "keep_ratio_actual": cm_stats.get("keep_ratio_actual", 1.0),
+        "predictmem_scoring_latency_s": cm_stats.get("predictmem_scoring_latency_s", 0),
+        "qwen_visual_latency_s": cm_stats.get("qwen_visual_latency_s", 0),
+        "num_tubelets_scored": cm_stats.get("num_tubelets_scored", 0),
+        "scored_tubelets": cm_stats.get("scored_tubelets", []),
+        "full_keep_tail_tubelets": cm_stats.get("full_keep_tail_tubelets", []),
+        "predictmem_stats": cm_stats,
     }
 
     return response, stats

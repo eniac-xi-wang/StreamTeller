@@ -42,6 +42,9 @@ WINDOW_FRAMES=16
 STRIDE_FRAMES=2
 TAIL_KEEP_FRAMES=4
 DROP_BOOTSTRAP=true
+RECORD_KEEP_MASKS=false
+COMPACT_MEMORY=0
+VIDEO_CHUNK_T=0
 
 # -- Video sampling --
 FPS="1.0"
@@ -90,6 +93,9 @@ while [[ $# -gt 0 ]]; do
     --tail-keep-frames) TAIL_KEEP_FRAMES="$2"; shift 2 ;;
     --drop-bootstrap) DROP_BOOTSTRAP=true; shift ;;
     --no-drop-bootstrap) DROP_BOOTSTRAP=false; shift ;;
+    --record-keep-masks) RECORD_KEEP_MASKS=true; shift ;;
+    --compact-memory) COMPACT_MEMORY="$2"; shift 2 ;;
+    --video-chunk-t) VIDEO_CHUNK_T="$2"; shift 2 ;;
     --fps) FPS="$2"; shift 2 ;;
     --qwen-size) QWEN_SIZE="$2"; shift 2 ;;
     --jepa-size) JEPA_SIZE="$2"; shift 2 ;;
@@ -198,6 +204,9 @@ cfg = {
     'torch_dtype': '${TORCH_DTYPE}',
     'num_gpus': ${NUM_GPUS},
     'disable_thinking': '${DISABLE_THINKING}' == 'true',
+    'record_keep_masks': '${RECORD_KEEP_MASKS}' == 'true',
+    'compact_memory': ${COMPACT_MEMORY},
+    'video_chunk_t': ${VIDEO_CHUNK_T},
     'task_json': '${TASK_JSON}',
     'video_dir': '${OVO_VIDEO_DIR}',
     'result_dir': '${RESULT_DIR}',
@@ -244,6 +253,14 @@ ARGS=(
 
 ${DROP_BOOTSTRAP} && ARGS+=(--drop_bootstrap) || ARGS+=(--no_drop_bootstrap)
 ${DISABLE_THINKING} && ARGS+=(--disable_thinking)
+${RECORD_KEEP_MASKS} && ARGS+=(--record_keep_masks)
+
+if [[ -n "${COMPACT_MEMORY}" ]] && [[ "${COMPACT_MEMORY}" -gt 0 ]]; then
+  ARGS+=(--compact_memory)
+fi
+if [[ -n "${VIDEO_CHUNK_T}" ]] && [[ "${VIDEO_CHUNK_T}" -gt 0 ]]; then
+  ARGS+=(--video_chunk_t "${VIDEO_CHUNK_T}")
+fi
 
 if [[ -n "${FRAME_BUDGET}" ]] && [[ "${FRAME_BUDGET}" -gt 0 ]]; then
   ARGS+=(--frame_budget "${FRAME_BUDGET}")

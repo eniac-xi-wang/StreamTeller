@@ -147,6 +147,7 @@ def run_single(args):
         stride_frames=args.stride_frames,
         tail_keep_frames=args.tail_keep_frames,
         drop_bootstrap=args.drop_bootstrap,
+        record_keep_masks=getattr(args, "record_keep_masks", False),
     )
     processor = load_qwen35_processor(args.model_path, fps=args.fps)
     logger.info(f"Model loaded")
@@ -192,6 +193,7 @@ def run_single(args):
                     predictmem_keep_ratio=args.predictmem_keep_ratio,
                     fps=args.fps, max_new_tokens=args.max_new_tokens,
                     disable_thinking=True,
+                    video_chunk_t=getattr(args, "video_chunk_t", 0),
                 )
 
                 predicted = _extract_answer(response) if has_options else response.strip()
@@ -280,6 +282,12 @@ def run_multi_gpu(args):
             cmd += ["--jepa_checkpoint_path", args.jepa_checkpoint_path]
         if getattr(args, "vjepa_src_path", None):
             cmd += ["--vjepa_src_path", args.vjepa_src_path]
+        if getattr(args, "record_keep_masks", False):
+            cmd.append("--record_keep_masks")
+        if getattr(args, "compact_memory", False):
+            cmd.append("--compact_memory")
+        if getattr(args, "video_chunk_t", 0) > 0:
+            cmd += ["--video_chunk_t", str(args.video_chunk_t)]
         if args.time_window_size is not None:
             cmd += ["--time_window_size", str(args.time_window_size)]
 
@@ -347,6 +355,9 @@ def build_parser():
     p.add_argument("--device", default="cuda")
     p.add_argument("--torch_dtype", default="bfloat16")
     p.add_argument("--disable_thinking", action="store_true", default=True)
+    p.add_argument("--record_keep_masks", action="store_true", default=False)
+    p.add_argument("--compact_memory", action="store_true", default=False)
+    p.add_argument("--video_chunk_t", type=int, default=0)
     # Multi-GPU
     p.add_argument("--multi_gpu", action="store_true")
     p.add_argument("--num_gpus", type=int, default=1)

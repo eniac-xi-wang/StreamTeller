@@ -169,6 +169,7 @@ def run_single(args):
         stride_frames=args.stride_frames,
         tail_keep_frames=args.tail_keep_frames,
         drop_bootstrap=args.drop_bootstrap,
+        record_keep_masks=getattr(args, "record_keep_masks", False),
     )
     processor = load_qwen35_processor(args.model_path, fps=args.fps)
     logger.info(f"Model loaded: {sum(p.numel() for p in model.parameters())/1e9:.1f}B params")
@@ -213,6 +214,7 @@ def run_single(args):
                     predictmem_keep_ratio=args.predictmem_keep_ratio,
                     fps=args.fps, max_new_tokens=args.max_new_tokens,
                     disable_thinking=args.disable_thinking,
+                    video_chunk_t=getattr(args, "video_chunk_t", 0),
                 )
 
                 entry = {
@@ -257,6 +259,7 @@ def run_single(args):
                         predictmem_keep_ratio=args.predictmem_keep_ratio,
                         fps=args.fps, max_new_tokens=args.max_new_tokens,
                         disable_thinking=args.disable_thinking,
+                        video_chunk_t=getattr(args, "video_chunk_t", 0),
                     )
 
                     entry["test_info"][i]["response"] = response.strip()
@@ -341,6 +344,12 @@ def run_multi_gpu(args):
             cmd += ["--vjepa_src_path", args.vjepa_src_path]
         if args.disable_thinking:
             cmd.append("--disable_thinking")
+        if getattr(args, "record_keep_masks", False):
+            cmd.append("--record_keep_masks")
+        if getattr(args, "compact_memory", False):
+            cmd.append("--compact_memory")
+        if getattr(args, "video_chunk_t", 0) > 0:
+            cmd += ["--video_chunk_t", str(args.video_chunk_t)]
         if args.frame_budget:
             cmd += ["--frame_budget", str(args.frame_budget)]
 
@@ -404,6 +413,9 @@ def build_parser():
     p.add_argument("--torch_dtype", default="bfloat16")
     p.add_argument("--disable_thinking", action="store_true", default=True)
     p.add_argument("--enable_thinking", dest="disable_thinking", action="store_false")
+    p.add_argument("--record_keep_masks", action="store_true", default=False)
+    p.add_argument("--compact_memory", action="store_true", default=False)
+    p.add_argument("--video_chunk_t", type=int, default=0)
     # Task selection
     p.add_argument("--task", nargs="+", choices=ALL_TASKS, default=ALL_TASKS)
     p.add_argument("--sample_ids", nargs="+", default=None)

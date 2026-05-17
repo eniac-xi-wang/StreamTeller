@@ -283,12 +283,13 @@ class PredictMemStreamingMemory(nn.Module):
             "num_tail_tubelets_kept_full": len(tail_keep_tubelets),
             "tdigest_samples": len(tdigest),
             "window_mode": "expanding+sliding",
-            "predictmem_keep_masks": {
+        }
+        if self.config.record_keep_masks:
+            stats["predictmem_keep_masks"] = {
                 "grid_h": grid_h,
                 "grid_w": grid_w,
                 "tubelets": keep_masks_tubelets,
-            },
-        }
+            }
 
         return pruned_hidden, pruned_pos, pruned_attn, video_keep_indices_list, stats
 

@@ -1628,6 +1628,9 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         predictmem_keep_indices: list | None = None,
         predictmem_frames_256: torch.Tensor | None = None,
         predictmem_keep_ratio: float = 0.10,
+        video_chunk_t: int = 0,
+        compact_video_embeds: torch.Tensor | None = None,
+        compact_video_position_ids: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5ModelOutputWithPast:
         r"""
@@ -1642,6 +1645,14 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             Takes priority over ``predictmem_keep_indices`` when provided.
         predictmem_keep_indices (`list[torch.LongTensor]`, *optional*):
             Per-sample Qwen video-local token indices to keep when `use_predictmem=True`.
+        video_chunk_t (`int`, *optional*, defaults to 0):
+            When > 0 and a video grid_t exceeds this value, call the visual tower in
+            temporal chunks instead of all-at-once (reduces visual-forward peak memory).
+        compact_video_embeds (`torch.Tensor`, *optional*):
+            Pre-computed compact visual embeddings [K_total, hidden_dim]. When
+            provided, ``pixel_values_videos`` is ignored and visual forward is skipped.
+        compact_video_position_ids (`torch.Tensor`, *optional*):
+            Pre-computed 3D position ids [3, K_total] for compact visual tokens.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1660,12 +1671,67 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if pixel_values_videos is not None:
-            video_outputs: BaseModelOutputWithPooling = self.get_video_features(
-                pixel_values_videos, video_grid_thw, return_dict=True
+        if compact_video_embeds is not None and input_ids is not None:
+            # Compact memory path: pre-pruned visual embeddings, skip visual tower.
+            # Scatter into compact placeholder (K video tokens instead of full).
+            _, video_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds,
+                video_features=compact_video_embeds,
             )
-            video_embeds = video_outputs.pooler_output
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(
+                video_mask, compact_video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            )
+            if compact_video_position_ids is not None:
+                # Insert compact 3D positions into video segment of position_ids.
+                # Compact positions are [3, K_total]; the placeholder mask marks
+                # where they go. Text positions are computed from the mask.
+                full_pos = position_ids if position_ids is not None else \
+                    torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) \
+                         .view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+                for b in range(inputs_embeds.shape[0]):
+                    video_slots = video_mask[b].any(dim=-1)
+                    if video_slots.sum() == compact_video_position_ids.shape[1]:
+                        full_pos[:, b, video_slots] = compact_video_position_ids.to(
+                            device=full_pos.device, dtype=full_pos.dtype
+                        )
+                position_ids = full_pos
+
+        elif pixel_values_videos is not None:
+            # Full visual forward (optionally chunked)
+            pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+
+            if video_chunk_t > 0 and video_grid_thw is not None and \
+                    any(int(t) > video_chunk_t for t in video_grid_thw[:, 0].tolist()):
+                # Temporal chunking to reduce visual-tower peak memory
+                def _visual_forward_videos_chunked(pixels, grid_thw, chunk_t):
+                    outs = []
+                    base = 0
+                    for t, h, w in grid_thw.tolist():
+                        t, h, w = int(t), int(h), int(w)
+                        tpf = h * w  # tokens per frame
+                        for t0 in range(0, t, chunk_t):
+                            cur_t = min(chunk_t, t - t0)
+                            s = base + t0 * tpf
+                            e = s + cur_t * tpf
+                            clip_pixels = pixels[s:e]
+                            clip_grid = grid_thw.new_tensor([[cur_t, h, w]])
+                            outs.append(self.visual(clip_pixels, grid_thw=clip_grid))
+                        base += t * tpf
+                    if len(outs) == 0:
+                        return pixels.new_empty((0, self.visual.config.out_hidden_size))
+                    return torch.cat(outs, dim=0)
+
+                video_embeds = _visual_forward_videos_chunked(
+                    pixel_values_videos, video_grid_thw, video_chunk_t
+                )
+            else:
+                video_outputs: BaseModelOutputWithPooling = self.get_video_features(
+                    pixel_values_videos, video_grid_thw, return_dict=True
+                )
+                video_embeds = video_outputs.pooler_output
+                video_embeds = torch.cat(video_embeds, dim=0)
+
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
@@ -1946,6 +2012,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         predictmem_keep_indices: list | None = None,
         predictmem_frames_256: torch.Tensor | None = None,
         predictmem_keep_ratio: float = 0.10,
+        video_chunk_t: int = 0,
+        compact_video_embeds: torch.Tensor | None = None,
+        compact_video_position_ids: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5CausalLMOutputWithPast:
         r"""
@@ -2014,6 +2083,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             predictmem_keep_indices=predictmem_keep_indices,
             predictmem_frames_256=predictmem_frames_256,
             predictmem_keep_ratio=predictmem_keep_ratio,
+            video_chunk_t=video_chunk_t,
+            compact_video_embeds=compact_video_embeds,
+            compact_video_position_ids=compact_video_position_ids,
             **kwargs,
         )
 
