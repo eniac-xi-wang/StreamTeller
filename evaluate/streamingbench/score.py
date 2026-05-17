@@ -18,12 +18,8 @@ def _extract_answer(response: str) -> str | None:
         return None
     response = response.strip()
     patterns = [
-        r"option\s*([A-D])",
-        r"([A-D])\s*is\s*the\s*best",
-        r"answer\s*is\s*([A-D])",
-        r"([A-D])\)",
-        r"^([A-D])$",
-        r"option is\s*([A-D])",
+        r"answer is ([A-D])",
+        r"^([A-D])[\.:\s]",
         r"\(([A-D])\)",
     ]
     for pat in patterns:
