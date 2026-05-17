@@ -31,6 +31,9 @@ class PredictMemConfig:
     tail_keep_frames: int = 4  # last N frames always kept
     drop_bootstrap: bool = True  # drop tubelet 0 (frames 0-1)
 
+    # ── Stats / logging ──
+    record_keep_masks: bool = False  # write full per-tubelet keep masks to JSONL
+
     # Derived properties (computed on access, not stored)
     jepa_grid_t: int = field(init=False, default=8)
     jepa_grid_h: int = field(init=False, default=16)
