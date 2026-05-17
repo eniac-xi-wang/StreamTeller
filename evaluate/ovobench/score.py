@@ -96,11 +96,14 @@ def score_all(results: dict[str, list[dict]]) -> dict:
         if category_scores:
             eval_results[category]["average"] = round(sum(category_scores) / len(category_scores), 2)
 
-    overall = []
+    overall = 0.0
+    n_cats = 0
     for cat in ["backward", "realtime", "forward"]:
-        if eval_results[cat]["average"] is not None:
-            overall.append(eval_results[cat]["average"])
-    eval_results["Overall Avg."] = round(sum(overall) / len(overall), 2) if overall else None
+        avg = eval_results[cat].get("average")
+        if avg is not None:
+            overall += avg
+        n_cats += 1
+    eval_results["Overall Avg."] = round(overall / n_cats, 2) if n_cats > 0 else None
 
     return eval_results
 

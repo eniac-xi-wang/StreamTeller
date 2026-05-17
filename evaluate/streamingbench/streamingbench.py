@@ -77,7 +77,7 @@ def _extract_answer(response: str) -> str:
         if m:
             return m.group(1).upper()
     m = re.search(r"[A-D]", response)
-    return m.group(0) if m else response
+    return m.group(0) if m else None
 
 
 def _format_prompt(question: str, options_str) -> str:
