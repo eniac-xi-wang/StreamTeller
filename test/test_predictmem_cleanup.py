@@ -22,6 +22,9 @@ MAINLINE_FILES = {
     "vjepa_scorer.py",
     "vision_inputs.py",
     "token_pruner.py",
+    "compact_memory.py",
+    "streaming_sampler.py",
+    "qwen_visual_chunk.py",
 }
 
 LEGACY_SYMBOLS = {
