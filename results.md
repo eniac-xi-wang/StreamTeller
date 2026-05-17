@@ -1,170 +1,190 @@
-# PredictMem 第五轮验证结果：配置收口与 bash 入口
+# PredictMem 第六轮：从"全量 token 后剪枝"改为 FluxMem-like 动态 memory
 
-测试时间：2026-05-16
+测试时间：2026-05-17
 
 ## 执行摘要
 
-按照最新 `instruct.md`（P0-P8），完成了配置体系的重构：
-- **P0**: Bash 成为唯一正式配置入口，包含完整配置区
-- **P1**: 修复 `PREDICTMEM_RUNTIME` 自动检测（method=predictmem → plugin，baseline → none）
-- **P2**: V-JEPA checkpoint/source path 由 bash 传入，Python 无硬编码
-- **P3**: 所有 Python 入口补齐 CLI 参数，multi-GPU worker 完整透传
-- **P4**: 视频采样 time clipping 实现，MAX_PIXELS 透传
-- **P5**: Bash 入口为正式复现入口
-- **P6**: 每次运行保存 `run_config.json` + `run_command.sh`
-- **P7**: 10 个新测试（bash config + video clipping）+ 21 个已有 = 31 tests
-- **P8**: 更新 results.md
+按照最新 `instruct.md`（P0-P7），完成了从"后剪枝"到"compact memory"的架构重构：
 
-## P0+P1：Bash 配置区 + Runtime 自动检测
+- **P0**: 新增 `evaluate/common/memory_debug.py` — GPU 显存 trace 工具，记录 10 个检查点
+- **P1**: 从 FluxMem 移植 `_visual_forward_videos_chunked` 到 Qwen3.5，新增 `video_chunk_t` 参数
+- **P2**: 实现 compact memory 核心模块（`streaming_sampler`, `qwen_visual_chunk`, `compact_memory`）
+- **P3**: V-JEPA 到 Qwen visual chunk 对齐（从同一 source frame 产生，共享 tubelet 映射）
+- **P4**: Slim stats — `record_keep_masks` config flag，默认不写完整 keep masks
+- **P5**: 完整 bash→Python→model 参数透传（`COMPACT_MEMORY`, `VIDEO_CHUNK_T`, `RECORD_KEEP_MASKS`）
+- **P7**: 遵守不要做的事清单 — 不继续在后剪枝 path 补丁，不把 `empty_cache()` 当解决方案
 
-### 已排查并修复的问题
+## P0：Memory Trace 工具
 
-| # | 问题 | 修复 |
-|---|---|---|
-| 1 | bash `PREDICTMEM_RUNTIME="none"` 导致 predictmem 不启用 | 改为 `=""`，自动检测：method=predictmem → plugin |
-| 2 | V-JEPA checkpoint 硬编码在 `streaming_memory.py` | 移除，由 `config.jepa_checkpoint_path` 接入 |
-| 3 | V-JEPA source 硬编码在 `vjepa_scorer.py` | 支持 `vjepa_src_path` 参数，bash 透传 |
-| 4 | StreamingBench `start_time/end_time` 未使用 | 传入 `build_video_inputs_for_eval()` |
-| 5 | bash `MAX_PIXELS` 未透传 Python | 已加入 ARGS |
-| 6 | common helper 不支持时间裁剪 | 新增 `start_time/end_time` 实现 |
-| 7 | multi-GPU worker 未透传配置 | 全部补全 |
-| 8 | smoke 命令直接调 Python | 全部改为 bash entry |
+文件：`evaluate/common/memory_debug.py`
 
-### Bash 配置区示例（ovobench.sh）
+记录检查点：
+```
+sample_begin / before_video_sampling / after_video_sampling
+after_processor / before_qwen_visual / after_qwen_visual
+after_masked_scatter / after_predictmem_prune
+before_language_model / after_generate / sample_end
+```
 
+每检查点记录：
+- `torch.cuda.memory_allocated()` / `reserved()` / `max_allocated()` / `max_reserved()`
+- `torch.cuda.mem_get_info()` (free/total)
+- NVML used memory
+- RSS
+- num_frames / video_grid_thw / full_video_tokens / kept_video_tokens
+
+使用方式：
+```python
+from evaluate.common.memory_debug import MemoryTracer
+with MemoryTracer(enabled=True, log_path="mem.jsonl") as tracer:
+    tracer.checkpoint("before_video_sampling", num_frames=N)
+    # ... processing ...
+    tracer.checkpoint("after_generate", kept_video_tokens=K)
+# Auto-writes peak_stage() summary
+```
+
+## P1：Visual Chunking
+
+参考 FluxMem `_visual_forward_videos_chunked()`：
+
+```python
+# Qwen3_5Model.forward 新增参数
+video_chunk_t: int = 0
+
+# 当 video_chunk_t > 0 且 grid_t > chunk_t 时按 temporal chunk 调用 visual tower
+if video_chunk_t > 0 and any(int(t) > video_chunk_t for t in video_grid_thw[:, 0].tolist()):
+    video_embeds = _visual_forward_videos_chunked(pixel_values_videos, video_grid_thw, video_chunk_t)
+else:
+    # 原始 full forward
+```
+
+对比实验：
 ```bash
-MODEL_PATH="/data/model_weights_public/Qwen/Qwen3.5-9B"
-JEPA_CHECKPOINT="/data/model_weights_public/jepa/jeap_vitl_16_256.pt"
-VJEPA_SRC="${REPO_ROOT}/site-packages/vjepa2"
-
-METHOD="predictmem"
-PREDICTMEM_RUNTIME=""        # auto: predictmem→plugin, baseline→none
-PREDICTMEM_KEEP_RATIO="0.10"
-WINDOW_FRAMES=16
-STRIDE_FRAMES=2
-TAIL_KEEP_FRAMES=4
-DROP_BOOTSTRAP=true
-
-FPS="1.0"
-QWEN_SIZE=512
-JEPA_SIZE=256
-
-export PYTHONPATH="${REPO_ROOT}:${LOCAL_MODELS_DIR}:${VJEPA_SRC}:${PYTHONPATH:-}"
+VIDEO_CHUNK_T=0   # full visual（当前后剪枝路径）
+VIDEO_CHUNK_T=8   # 按 8 frame chunks
+VIDEO_CHUNK_T=4   # 更细粒度
 ```
 
-### Runtime 自动检测逻辑
+## P2：Compact Memory 核心
 
-```bash
-if [[ -z "${PREDICTMEM_RUNTIME}" ]]; then
-  if [[ "${METHOD}" == "predictmem" ]]; then
-    PREDICTMEM_RUNTIME="plugin"
-  else
-    PREDICTMEM_RUNTIME="none"
-  fi
-fi
+新增模块：
+
+```text
+models/predictmem/
+  streaming_sampler.py    ← 流式 decord 采样，每次 yield 一个 tubelet
+  qwen_visual_chunk.py    ← 对单个 tubelet 调用 Qwen visual tower
+  compact_memory.py        ← 维护 compact visual memory，永远不构造完整 token
 ```
 
-## P2：Hardcoded Paths 清理结果
+### StreamingVideoSampler
 
+- 按 1FPS 逐 tubelet yield，不一次性 `get_batch` 全视频
+- 每个 tubelet 返回 Qwen uint8 [n, 512, 512, 3] + JEPA float32 [n, 3, 256, 256]
+- 支持 start_time/end_time 裁剪 + frame_budget
+
+### QwenVisualChunkProcessor
+
+- `process_tubelet(frames, tubelet_id)` → (embeddings [n_tokens, D], position_ids [3, n_tokens])
+- 只处理当前 tubelet 的视觉特征，不持有其他帧的 tensor
+
+### PredictMemCompactMemory
+
+核心流程：
 ```
-rg "/data/model_weights_public/jepa|jeap_vitl_16_256.pt" models/predictmem evaluate
-```
-- Bash 默认配置中保留（作为可覆盖的默认值）✓
-- Python 主逻辑 **零命中** ✓
-
-## P3+P4：CLI 参数 + 视频裁剪
-
-### OVO-Bench Python 新增参数
-
-```
---jepa_checkpoint_path, --vjepa_src_path, --device, --torch_dtype
---qwen_size, --jepa_size, --window_frames, --stride_frames
---tail_keep_frames, --drop_bootstrap/--no_drop_bootstrap
---frame_budget, --stream_mode, --disable_thinking/--enable_thinking
---baseline_result_dir
-```
-
-### StreamingBench Python 新增参数
-
-Same + `--max_pixels`, `--max_num_frames`, `--time_window_size`
-
-### Video Time Clipping
-
-`build_video_inputs_for_eval(video_path, start_time=10, end_time=30, fps=1.0)` 现在正确采样 [10s, 30s) 区间，Qwen 512 和 V-JEPA 256 使用同一批 `frames_indices`。
-
-## P5：Bash 正式入口
-
-OVO smoke：
-```bash
-bash evaluate/ovobench/ovobench.sh \
-  --model-path /data/model_weights_public/Qwen/Qwen3.5-9B \
-  --jepa-checkpoint /data/model_weights_public/jepa/jeap_vitl_16_256.pt \
-  --vjepa-src /root/stream/StreamTeller/site-packages/vjepa2 \
-  --method predictmem --run-name predictmem_ovobench_smoke \
-  --num-gpus 1 --max-samples 2
+1. decord 流式读取必要帧 (StreamingVideoSampler)
+2. 维护最多 16 frame 的 V-JEPA ring buffer
+3. V-JEPA 对当前 target tubelet 算 predict loss
+4. t-digest 在线更新阈值，得到 keep mask
+5. 对当前 tubelet 调用 Qwen visual tower (QwenVisualChunkProcessor)
+6. 立即应用 keep mask，保留 compact embeddings
+7. append 到 compact memory，丢弃当前 chunk 的 full tensor
+8. 最后只输出 compact visual memory
 ```
 
-StreamingBench smoke：
-```bash
-bash evaluate/streamingbench/streamingbench.sh \
-  --model-path /data/model_weights_public/Qwen/Qwen3.5-9B \
-  --jepa-checkpoint /data/model_weights_public/jepa/jeap_vitl_16_256.pt \
-  --vjepa-src /root/stream/StreamTeller/site-packages/vjepa2 \
-  --task-csv /path/to/Real_Time_Visual_Understanding.csv \
-  --video-dir /path/to/StreamingBench/data/real \
-  --method predictmem --run-name predictmem_streamingbench_smoke \
-  --num-gpus 1 --dry-run
+关键保证：
+- GPU 上从不持有整段视频的 `pixel_values_videos`
+- 从不构造整段视频的 full `video_embeds`
+- 从不构造整段视频的 full `inputs_embeds` 后再 prune
+
+新增 Qwen3.5 forward 参数：
+```python
+compact_video_embeds: torch.Tensor | None = None
+compact_video_position_ids: torch.Tensor | None = None
 ```
 
-## P6：Run Config
+当 `compact_video_embeds` 非空时：
+- 跳过 `get_video_features()` / visual tower
+- 跳过 `pixel_values_videos`
+- 将 compact embeddings scatter 到 K 个 video placeholder
+- 使用 compact position_ids 作为 video token 的 3D 位置
 
-每次运行生成：
-- `${RESULT_DIR}/run_config.json` — model_path, jepa_checkpoint, vjepa_src, 所有参数 + git_commit
-- `${RESULT_DIR}/run_command.sh` — bash 脚本副本
+## P4：Slim Stats
 
-ODry-run 验证输出：
-```
-OVO predictmem --dry-run:
-  Pred runtime: plugin  ✓
-  JEPA ckpt: /data/model_weights_public/jepa/jeap_vitl_16_256.pt  ✓
-  V-JEPA src: /root/stream/StreamTeller/site-packages/vjepa2  ✓
-
-OVO baseline --dry-run:
-  Pred runtime: none  ✓
-
-StreamingBench predictmem --dry-run:
-  Pred runtime: plugin  ✓
-  MAX_PIXELS passthrough  ✓
+`PredictMemConfig` 新增：
+```python
+record_keep_masks: bool = False
 ```
 
-## P7：测试结果
+正式 JSONL 只写 slim stats：
+```
+original_video_tokens, kept_video_tokens, dropped_video_tokens,
+keep_ratio_actual, num_tubelets_scored, scored_tubelets,
+full_keep_tail_tubelets, predictmem_scoring_latency_s,
+qwen_visual_latency_s, compact_memory_tokens,
+peak_allocated_mb, peak_reserved_mb
+```
 
-| 测试文件 | 测试项 | 状态 |
-|---|---|---|
-| `test_eval_bash_config.py` | runtime auto-detect / dry-run config / Python --help params / no hardcoded ckpt / multi-GPU passthrough | 9/9 ✓ |
-| `test_eval_common_predictmem.py` | kwargs / stats / time clip / frame budget / Qwen-JEPA frame match | 8/8 ✓ |
-| `test_eval_ovobench.py` | prompts / scoring / path resolver / no evaluation/ paths | 8/8 ✓ |
-| `test_eval_streamingbench.py` | timestamp / answer extraction / prompt format / scoring / no evaluation/ paths | 7/7 ✓ |
+完整 keep masks 只在 `--record-keep-masks` 开启时才写入。
 
-总计：**31 tests passing**
+## P5：实验矩阵
+
+| 实验 | COMPACT_MEMORY | VIDEO_CHUNK_T | 说明 |
+|------|---|---|---|
+| A | 0 | 0 | 当前后剪枝路径 baseline |
+| B | 0 | 8 | 仅 visual chunking |
+| C | 1 | 1 | Compact memory（目标方案）|
+| D | 1 | 1 | 长视频重复 20 次显存稳定性 |
+
+## 测试结果
+
+新增 `test/test_predictmem_streaming.py`：11 tests
+
+| 测试 | 结果 |
+|---|---|
+| streaming_sampler shapes (Qwen 512, JEPA 256) | ✓ |
+| streaming_sampler tubelet iteration (8 tubelets, 16 frames) | ✓ |
+| streaming_sampler time clip (full=215, clip0-5=5) | ✓ |
+| streaming_sampler frame_budget=8 | ✓ |
+| streaming_sampler metadata keys | ✓ |
+| memory_debug snapshot keys | ✓ |
+| MemoryTracer context manager + log | ✓ |
+| record_keep_masks config flag | ✓ |
+| PredictMemCompactMemory import | ✓ |
+| StreamingVideoSampler import | ✓ |
+| QwenVisualChunkProcessor import | ✓ |
 
 ## 文件变更汇总
 
 | 文件 | 变更 |
 |---|---|
-| `models/predictmem/config.py` | 新增 jepa_checkpoint_path, vjepa_src_path, tail_keep_frames, drop_bootstrap |
-| `models/predictmem/vjepa_scorer.py` | make_vjepa_analyzer_scorer 支持 vjepa_src_path 参数 |
-| `models/predictmem/streaming_memory.py` | _ensure_scorer 使用 config 路径，移除硬编码 checkpoint |
-| `evaluate/common/qwen35_predictmem.py` | load_qwen35_model 配置 plugin config；build_video_inputs_for_eval 实现 time clipping |
-| `evaluate/ovobench/ovobench.py` | build_parser 新增全部配置参数；model loading 传参；multi-GPU 命令完整透传 |
-| `evaluate/ovobench/ovobench.sh` | **重写** — 完整配置区、runtime auto-detect、run_config.json、run_command.sh |
-| `evaluate/streamingbench/streamingbench.py` | build_parser 新增全部参数；time_window 实际生效；multi-GPU 完整透传 |
-| `evaluate/streamingbench/streamingbench.sh` | **重写** — 完整配置区、MAX_PIXELS 透传 |
-| `test/test_eval_bash_config.py` | **新增** |
-| `test/test_eval_common_predictmem.py` | 新增 video clipping 测试 |
+| `evaluate/common/memory_debug.py` | **新增** — GPU memory trace 工具 |
+| `models/predictmem/streaming_sampler.py` | **新增** — 流式逐 tubelet 采样 |
+| `models/predictmem/qwen_visual_chunk.py` | **新增** — 单 tubelet visual tower |
+| `models/predictmem/compact_memory.py` | **新增** — compact memory 核心 |
+| `models/predictmem/config.py` | 新增 `record_keep_masks` 字段 |
+| `models/predictmem/streaming_memory.py` | keep masks 受 `record_keep_masks` 控制 |
+| `models/qwen3_5/modeling_qwen3_5.py` | 新增 `video_chunk_t`, `compact_video_embeds`, `compact_video_position_ids`；visual chunking 逻辑；compact embeds scatter 路径 |
+| `evaluate/common/qwen35_predictmem.py` | 新增 `generate_with_compact_memory()`；`load_qwen35_model` 接受 `record_keep_masks`；`generate_qwen35_response` 接受 `video_chunk_t` |
+| `evaluate/ovobench/ovobench.py` | 新增 `--compact_memory`, `--video_chunk_t`, `--record_keep_masks` |
+| `evaluate/ovobench/ovobench.sh` | 新增 `COMPACT_MEMORY`, `VIDEO_CHUNK_T`, `RECORD_KEEP_MASKS` 配置 |
+| `evaluate/streamingbench/streamingbench.py` | 同上 |
+| `evaluate/streamingbench/streamingbench.sh` | 同上 |
+| `test/test_predictmem_streaming.py` | **新增** — 11 tests |
 
-## 下一步
+## 下一步（需要 GPU）
 
-1. OVO-Bench 正式评估（baseline + PredictMem，全量或 50 样本）
-2. StreamingBench 正式评估（baseline + PredictMem）
-3. V-JEPA scoring 延迟优化后跑 50-100 条对照实验
+1. **P0 验证**：用 MemoryTracer 跑长视频，确认峰值出现在 `after_qwen_visual` / `after_masked_scatter`
+2. **P1 实验 B**：`VIDEO_CHUNK_T=8` 判断 visual tower full forward 贡献多少峰值
+3. **P2 实验 C**：Compact memory 路径，判断是否避免 full video token 高水位
+4. **P5 实验 D**：长视频重复 20 次，验证 compact 路径显存稳定性
+5. 完成 `results.md` P6 报告（峰值阶段、chunking 效果、compact memory 效果、per-sample stats）
