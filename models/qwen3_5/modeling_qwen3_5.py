@@ -1706,6 +1706,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                 def _visual_forward_videos_chunked(pixels, grid_thw, chunk_t):
                     outs = []
                     base = 0
+                    merge = self.visual.spatial_merge_size ** 2
                     for t, h, w in grid_thw.tolist():
                         t, h, w = int(t), int(h), int(w)
                         tpf = h * w  # tokens per frame
@@ -1713,13 +1714,16 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                             cur_t = min(chunk_t, t - t0)
                             s = base + t0 * tpf
                             e = s + cur_t * tpf
-                            clip_pixels = pixels[s:e]
+                            clip_pixels = pixels[s:e].type(self.visual.dtype)
                             clip_grid = grid_thw.new_tensor([[cur_t, h, w]])
-                            chunk_out = self.get_video_features(
-                                clip_pixels, clip_grid, return_dict=True
+                            # Run visual tower, extract pooler_output (same as get_image_features)
+                            vis_out = self.visual(
+                                clip_pixels, grid_thw=clip_grid, return_dict=True
                             )
-                            chunk_embeds = chunk_out.pooler_output
-                            chunk_embeds = torch.cat(chunk_embeds, dim=0) if isinstance(chunk_embeds, list) else chunk_embeds
+                            vis_embeds = vis_out.pooler_output  # [total_tokens, hidden]
+                            split_sizes = (clip_grid.prod(-1) // merge).tolist()
+                            vis_embeds = list(torch.split(vis_embeds, split_sizes))
+                            chunk_embeds = torch.cat(vis_embeds, dim=0)
                             outs.append(chunk_embeds)
                         base += t * tpf
                     if len(outs) == 0:
