@@ -181,6 +181,147 @@ peak_allocated_mb, peak_reserved_mb
 | `evaluate/streamingbench/streamingbench.sh` | 同上 |
 | `test/test_predictmem_streaming.py` | **新增** — 11 tests |
 
+## 测试命令
+
+### 全部单元测试（无需 GPU）
+
+```bash
+# 设置 PYTHONPATH，跑所有 test/test_*.py
+cd /root/stream/StreamTeller
+export PYTHONPATH="$PWD:$PWD/evaluate:$PWD/models:$PWD/site-packages/vjepa2"
+for f in test/test_*.py; do echo "=== $f ===" && python "$f" && echo "PASS" || echo "FAIL"; done
+```
+
+当前结果：**11 pass, 0 fail, 2 skip** (skip = M0/P4 legacy tests 引用已迁移的 token_mapping)
+
+### 快速单元测试（仅新模块，无需 GPU）
+
+```bash
+cd /root/stream/StreamTeller
+export PYTHONPATH="$PWD:$PWD/evaluate:$PWD/models"
+python test/test_predictmem_streaming.py      # streaming sampler + compact memory imports
+python test/test_eval_common_predictmem.py    # common helper + video clipping
+python test/test_eval_ovobench.py             # OVO prompts + scoring + paths
+python test/test_eval_streamingbench.py       # StreamingBench timestamps + answer extraction
+python test/test_eval_bash_config.py          # bash entry config plumbing
+```
+
+### 实验 A：当前后剪枝路径 baseline（OVO-Bench，2 samples）
+
+```bash
+cd /root/stream/StreamTeller
+
+bash evaluate/ovobench/ovobench.sh \
+  --method predictmem \
+  --run-name expA_postprune \
+  --max-samples 2 \
+  --num-gpus 1
+```
+
+### 实验 B：仅 visual chunking（OVO-Bench，2 samples）
+
+```bash
+cd /root/stream/StreamTeller
+
+bash evaluate/ovobench/ovobench.sh \
+  --method predictmem \
+  --video-chunk-t 8 \
+  --run-name expB_chunkt8 \
+  --max-samples 2 \
+  --num-gpus 1
+```
+
+### 实验 C：Compact memory 路径（OVO-Bench，2 samples）
+
+需要先实现 `generate_with_compact_memory` 在 ovobench.py 中的集成。当前 compact memory 模块可通过以下方式验证：
+
+```bash
+cd /root/stream/StreamTeller
+
+# 验证 compact memory 各模块可导入且 streaming sampler 正常工作
+export PYTHONPATH="$PWD:$PWD/evaluate:$PWD/models:$PWD/site-packages/vjepa2"
+python -c "
+from predictmem.compact_memory import PredictMemCompactMemory
+from predictmem.streaming_sampler import StreamingVideoSampler
+from predictmem.config import PredictMemConfig
+
+# Test streaming sampler on real video
+sampler = StreamingVideoSampler(
+    '/data/qinian_workspace/OVO-Bench/chunked_videos/0.mp4',
+    fps=1.0, frame_budget=16
+)
+tubelets = list(sampler)
+print(f'{len(tubelets)} tubelets, {sampler.num_frames} frames')
+for t in tubelets[:2]:
+    print(f'  tubelet {t[\"tubelet_id\"]}: qwen={t[\"qwen\"].shape}, jepa={t[\"jepa\"].shape}')
+"
+```
+
+### 实验 D：长视频重复 20 次显存稳定性测试
+
+```bash
+cd /root/stream/StreamTeller
+
+# 找到长视频（>60帧）或用现有数据
+python -c "
+from predictmem.streaming_sampler import StreamingVideoSampler
+import glob
+for v in sorted(Path('/data/qinian_workspace/OVO-Bench/chunked_videos').glob('*.mp4'))[:5]:
+    s = StreamingVideoSampler(str(v), fps=1.0)
+    print(f'{v.name}: {s.num_frames} frames, {s.num_tubelets} tubelets, {s.duration:.1f}s')
+" 2>/dev/null || echo "需要正确的视频路径"
+```
+
+### Memory Trace 独立测试
+
+```bash
+cd /root/stream/StreamTeller
+export PYTHONPATH="$PWD:$PWD/evaluate:$PWD/models"
+
+# 快速 smoke：创建 tensor 后取 snapshot
+python -c "
+import torch
+from evaluate.common.memory_debug import MemoryTracer, snapshot
+
+s = snapshot(0)
+print('Snapshot keys:', list(s.keys()))
+print(f'allocated={s[\"allocated_mb\"]}MB, reserved={s[\"reserved_mb\"]}MB')
+
+with MemoryTracer(enabled=True) as t:
+    x = torch.zeros(1000, 1000, device='cuda')
+    t.checkpoint('after_alloc', num_frames=16)
+    del x
+
+peak = t.peak_stage()
+print(f'Peak: {peak[\"checkpoint\"]} at {peak[\"memory\"][\"allocated_mb\"]}MB')
+print('MemoryTracer working OK')
+"
+```
+
+### 完整 OVO-Bench（20 samples，三种配置）
+
+```bash
+cd /root/stream/StreamTeller
+
+# A: 后剪枝
+bash evaluate/ovobench/ovobench.sh \
+  --method predictmem \
+  --run-name expA_full \
+  --max-samples 20 --num-gpus 1
+
+# B: visual chunking
+bash evaluate/ovobench/ovobench.sh \
+  --method predictmem --video-chunk-t 8 \
+  --run-name expB_full \
+  --max-samples 20 --num-gpus 1
+
+# C: compact memory (需要先完成 Python 侧集成)
+bash evaluate/ovobench/ovobench.sh \
+  --method predictmem --compact-memory 1 --video-chunk-t 1 \
+  --run-name expC_full \
+  --max-samples 20 --num-gpus 1
+```
+
 ## 下一步（需要 GPU）
 
 1. **P0 验证**：用 MemoryTracer 跑长视频，确认峰值出现在 `after_qwen_visual` / `after_masked_scatter`

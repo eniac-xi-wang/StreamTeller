@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 _repo_root = Path(__file__).parent.parent
-for _p in (_repo_root, _repo_root / "evaluate"):
+for _p in (_repo_root, _repo_root / "evaluate", _repo_root / "models"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
