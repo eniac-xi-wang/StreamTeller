@@ -58,24 +58,40 @@ def build_prompt(task: str, question: str, options: list, anno: dict | None = No
         )
     elif task == "REC":
         activity = anno.get("activity", "the action") if anno else "the action"
+        question_str = f"How many times did they {activity}?"
         return (
-            f"How many times was {activity} performed in the video?\n\n"
-            f"Respond only with a number.\n"
+            f"You're watching a video in which people may perform a certain type of "
+            f"action repetively. The person performing this kind of action are referred "
+            f"to as 'they' in the following statement. You're task is to count how many "
+            f"times have different people in the video perform this kind of action in "
+            f"total. One complete motion counts as one.\n"
+            f"Now, answer the following question: {question_str}\n"
+            f"Provide your answer as a single number (e.g., 0, 1, 2, 3...) indicating "
+            f"the total count.\n"
             f"Do not include any additional text or explanation in your response."
         )
     elif task == "SSR":
         step = anno["test_info"][index]["step"] if anno else "this step"
         return (
-            f"Is the following step being performed at the indicated time?\n"
-            f"Step: {step}\n\n"
-            f"Respond only with Yes or No.\n"
+            f"You're watching a tutorial video which contain a sequential of steps. "
+            f"The following is one step from the whole procedures:\n"
+            f"{step}\n"
+            f"Your task is to determine if the man or woman in the video is currently "
+            f"performing this step.\n"
+            f'Answer only with "Yes" or "No".\n'
             f"Do not include any additional text or explanation in your response."
         )
     elif task == "CRR":
         q = anno.get("question", "") if anno else ""
         return (
-            f"Question: {q}\n\n"
-            f"Respond only with Yes or No.\n"
+            f"You're responsible of answering questions based on the video content. "
+            f"The following question are relevant to the latest frames, i.e. the end "
+            f"of the video.\n"
+            f"{q}\n"
+            f"Decide whether existing visual content, especially latest frames, i.e. "
+            f"frames that near the end of the video, provide enough information for "
+            f"answering the question.\n"
+            f'Answer only with "Yes" or "No".\n'
             f"Do not include any additional text or explanation in your response."
         )
     return f"Question: {question}\n\nAnswer concisely."
