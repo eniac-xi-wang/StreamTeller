@@ -96,6 +96,7 @@ class PredictMemStreamingMemory(nn.Module):
         self.config = config
 
         self._scorer = None
+        self._scorer_img_size: tuple[int, int] | None = None
         self._pruner = TokenPruner(
             config=None,
             video_token_id=video_token_id,
@@ -103,8 +104,9 @@ class PredictMemStreamingMemory(nn.Module):
             vision_end_token_id=vision_end_token_id,
         )
 
-    def _ensure_scorer(self, device: torch.device):
-        if self._scorer is not None:
+    def _ensure_scorer(self, device: torch.device, img_size: tuple[int, int] | None = None):
+        scorer_img_size = img_size or (self.config.jepa_size, self.config.jepa_size)
+        if self._scorer is not None and self._scorer_img_size == scorer_img_size:
             return
         from .vjepa_scorer import VJEPAPredictLossScorer, make_vjepa_analyzer_scorer
 
@@ -117,6 +119,7 @@ class PredictMemStreamingMemory(nn.Module):
         models = make_vjepa_analyzer_scorer(
             checkpoint_path=checkpoint,
             device=str(device),
+            img_size=scorer_img_size,
             vjepa_src_path=self.config.vjepa_src_path,
         )
         self._scorer = VJEPAPredictLossScorer(
@@ -126,6 +129,7 @@ class PredictMemStreamingMemory(nn.Module):
             models["predictor"],
             degraded=models["degraded"],
         )
+        self._scorer_img_size = scorer_img_size
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -153,11 +157,25 @@ class PredictMemStreamingMemory(nn.Module):
         t1 = torch.cuda.Event(enable_timing=True)
         t0.record()
 
-        self._ensure_scorer(device)
-
         T = predictmem_frames_256.shape[0]
         num_tubelets = (T + 1) // 2
-        grid_h, grid_w = 16, 16
+        patch_size = self.config.patch_size
+        jepa_h, jepa_w = int(predictmem_frames_256.shape[-2]), int(predictmem_frames_256.shape[-1])
+        if jepa_h % patch_size != 0 or jepa_w % patch_size != 0:
+            raise ValueError(
+                f"PredictMem JEPA frames must be divisible by patch_size={patch_size}, got {(jepa_h, jepa_w)}"
+            )
+        grid_h, grid_w = jepa_h // patch_size, jepa_w // patch_size
+        if video_grid_thw is not None:
+            qwen_llm_h = int(video_grid_thw[0, 1].item()) // self.config.qwen_merge_size
+            qwen_llm_w = int(video_grid_thw[0, 2].item()) // self.config.qwen_merge_size
+            if (qwen_llm_h, qwen_llm_w) != (grid_h, grid_w):
+                raise ValueError(
+                    "PredictMem JEPA/Qwen token grids are not aligned: "
+                    f"JEPA={(grid_h, grid_w)} QwenLLM={(qwen_llm_h, qwen_llm_w)} "
+                    f"video_grid_thw={video_grid_thw.detach().cpu().tolist()}"
+                )
+        self._ensure_scorer(device, img_size=(jepa_h, jepa_w))
 
         # ── Boundary sets ──
         dropped_bootstrap_tubelets = [0]  # tubelet 0 always dropped
@@ -283,6 +301,8 @@ class PredictMemStreamingMemory(nn.Module):
             "num_tail_tubelets_kept_full": len(tail_keep_tubelets),
             "tdigest_samples": len(tdigest),
             "window_mode": "expanding+sliding",
+            "jepa_resize_hw": [jepa_h, jepa_w],
+            "token_grid_hw": [grid_h, grid_w],
         }
         if self.config.record_keep_masks:
             stats["predictmem_keep_masks"] = {

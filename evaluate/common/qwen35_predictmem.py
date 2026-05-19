@@ -2,7 +2,7 @@
 
 All evaluation scripts use these functions to ensure consistent:
   - Model / processor loading with configurable PredictMem plugin config
-  - Video sampling with start/end clipping (Qwen 512 + V-JEPA 256)
+  - Video sampling with start/end clipping (aspect-preserving Qwen/V-JEPA resize)
   - Generation kwargs (baseline vs PredictMem plugin)
   - Per-sample stats extraction
 """
@@ -114,7 +114,7 @@ def build_video_inputs_for_eval(
     stream_mode: str = "full",
     start_time: float | None = None,
     end_time: float | None = None,
-) -> tuple[np.ndarray, torch.Tensor | None, dict]:
+) -> tuple[np.ndarray, torch.Tensor | None, dict, dict]:
     """Sample a video with optional time clipping; return Qwen frames + V-JEPA tensor.
 
     All frame indices are derived from source video at ``fps``.  When
@@ -122,12 +122,19 @@ def build_video_inputs_for_eval(
     interval.  ``frame_budget`` further limits the total number of 1FPS frames.
 
     Returns:
-        qwen_frames_uint8: [N, qwen_size, qwen_size, 3] uint8 RGB
-        predictmem_frames_256: [N, 3, jepa_size, jepa_size] ImageNet-normalized
+        qwen_frames_uint8: [N, qwen_h, qwen_w, 3] uint8 RGB
+        predictmem_frames_256: [N, 3, jepa_h, jepa_w] ImageNet-normalized
         video_metadata: dict
     """
     import decord
     import torch.nn.functional as F
+
+    import sys
+    _models_dir = Path(__file__).parent.parent.parent / "models"
+    if str(_models_dir) not in sys.path:
+        sys.path.insert(0, str(_models_dir))
+
+    from predictmem.resize_utils import compute_aligned_resize
 
     decord.bridge.set_bridge("torch")
     vr = decord.VideoReader(str(video_path))
@@ -145,7 +152,12 @@ def build_video_inputs_for_eval(
     if frame_budget and frame_budget > 0:
         total_1fps = min(frame_budget, total_1fps)
 
-    times_s = [clip_start + i / fps for i in range(total_1fps)]
+    if stream_mode == "recent":
+        # Take the last total_1fps frames, closest to clip_end
+        # e.g. total_1fps=4, fps=1, duration=10 → [6, 7, 8, 9]
+        times_s = [clip_end - (total_1fps - i) / fps for i in range(total_1fps)]
+    else:
+        times_s = [clip_start + i / fps for i in range(total_1fps)]
     source_indices = [
         min(total_frames - 1, max(0, int(round(t * source_fps))))
         for t in times_s
@@ -159,20 +171,28 @@ def build_video_inputs_for_eval(
         frames_raw = torch.from_numpy(np.asarray(frames_raw))
     frames_raw = frames_raw.to(dtype=torch.uint8)  # [N, src_h, src_w, 3]
 
-    # Qwen frames: resize to qwen_size, keep uint8
+    source_h, source_w = int(frames_raw.shape[1]), int(frames_raw.shape[2])
+    (qwen_h, qwen_w), (jepa_h, jepa_w) = compute_aligned_resize(
+        source_height=source_h,
+        source_width=source_w,
+        qwen_size=qwen_size,
+        jepa_size=jepa_size,
+    )
+
+    # Qwen frames: smart resize, preserve aspect ratio, keep uint8
     frames_chw = frames_raw.permute(0, 3, 1, 2).float()
-    if frames_chw.shape[-2:] != (qwen_size, qwen_size):
-        qwen_chw = F.interpolate(frames_chw, size=(qwen_size, qwen_size),
+    if frames_chw.shape[-2:] != (qwen_h, qwen_w):
+        qwen_chw = F.interpolate(frames_chw, size=(qwen_h, qwen_w),
                                   mode="bilinear", align_corners=False)
     else:
         qwen_chw = frames_chw
     qwen_chw = qwen_chw.clamp(0, 255)
     qwen_frames_uint8 = qwen_chw.round().to(torch.uint8).permute(0, 2, 3, 1).contiguous().cpu().numpy()
 
-    # V-JEPA frames: resize to jepa_size, ImageNet normalize
+    # V-JEPA frames: same aspect ratio, exactly half Qwen resolution
     from predictmem.vision_inputs import IMAGENET_MEAN, IMAGENET_STD
-    if frames_chw.shape[-2:] != (jepa_size, jepa_size):
-        jepa_chw = F.interpolate(frames_chw, size=(jepa_size, jepa_size),
+    if frames_chw.shape[-2:] != (jepa_h, jepa_w):
+        jepa_chw = F.interpolate(frames_chw, size=(jepa_h, jepa_w),
                                   mode="bilinear", align_corners=False)
     else:
         jepa_chw = frames_chw
@@ -187,8 +207,8 @@ def build_video_inputs_for_eval(
         "fps": float(fps),
         "duration": clip_duration,
         "frames_indices": source_indices,
-        "height": qwen_size,
-        "width": qwen_size,
+        "height": qwen_h,
+        "width": qwen_w,
         "video_backend": "decord",
     }
 
@@ -197,6 +217,13 @@ def build_video_inputs_for_eval(
         "clip_start": clip_start,
         "clip_end": clip_end,
         "source_fps": source_fps,
+        "source_height": source_h,
+        "source_width": source_w,
+        "qwen_height": qwen_h,
+        "qwen_width": qwen_w,
+        "jepa_height": jepa_h,
+        "jepa_width": jepa_w,
+        "resize_mode": "qwen_smart_aspect_ratio",
     }
 
     return qwen_frames_uint8, predictmem_frames_256, video_metadata, extra_meta
@@ -356,6 +383,7 @@ def generate_with_compact_memory(
     video_path: str,
     fps: float = 1.0,
     frame_budget: int = 256,
+    stream_mode: str = "full",
     start_time: float = 0.0,
     end_time: float | None = None,
     predictmem_keep_ratio: float = 0.10,
@@ -400,10 +428,13 @@ def generate_with_compact_memory(
     cfg.keep_ratio = predictmem_keep_ratio
 
     # Ingest video streaming → build compact memory
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     cm = PredictMemCompactMemory(model, processor, cfg)
     cm.ingest_video_streaming(
         video_path, fps=fps, frame_budget=frame_budget,
+        stream_mode=stream_mode,
         start_time=start_time, end_time=end_time,
         keep_ratio=predictmem_keep_ratio, device=device,
     )
@@ -412,15 +443,16 @@ def generate_with_compact_memory(
     compact_embeds = assembled["visual_embeds"]
     compact_positions = assembled["visual_position_ids"]
     t_compact = time.perf_counter() - t0
+    compact_peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024) if device == "cuda" else 0.0
 
     K = compact_embeds.shape[0]
     if K == 0:
         raise RuntimeError("Compact memory is empty — all tokens were pruned.")
 
-    # Build minimal input sequence: <vision_start> + K video tokens + <vision_end> + text
     video_token_id = model.config.video_token_id
-    vision_start_id = model.config.vision_start_token_id
-    vision_end_id = model.config.vision_end_token_id
+    video_token = getattr(processor, "video_token", "<|video_pad|>")
+    vision_start = getattr(processor, "vision_start_token", "<|vision_start|>")
+    vision_end = getattr(processor, "vision_end_token", "<|vision_end|>")
 
     messages = [
         {"role": "user", "content": [
@@ -430,44 +462,30 @@ def generate_with_compact_memory(
     ]
     text = apply_chat_template(processor, messages, disable_thinking=disable_thinking)
 
-    # Manually construct input_ids with the right number of video placeholders
-    # The template produces something like "<vision_start><video>...<video><vision_end><text>"
-    # We need to replace the video token count with K
-    input_ids_full = processor.tokenizer.encode(text, return_tensors="pt")
-    video_mask = input_ids_full[0] == video_token_id
-    num_template_video = video_mask.sum().item()
+    compact_video_text = ""
+    for meta in cm_stats.get("compact_tubelets", []):
+        kept_tokens = int(meta.get("kept_tokens", 0))
+        if kept_tokens <= 0:
+            continue
+        ts = float(meta.get("timestamp_s", 0.0))
+        compact_video_text += f"<{ts:.1f} seconds>{vision_start}{video_token * kept_tokens}{vision_end}"
 
-    if num_template_video == 0:
-        # Fallback: construct manually
-        prefix_ids = [vision_start_id] + [video_token_id] * K + [vision_end_id]
-        text_tokens = processor.tokenizer.encode(prompt, add_special_tokens=False)
-        input_ids = torch.tensor([prefix_ids + text_tokens], dtype=torch.long, device=device)
-    elif num_template_video != K:
-        # Replace placeholder count with actual K
-        token_list = input_ids_full[0].tolist()
-        new_tokens = []
-        for tok in token_list:
-            if tok == video_token_id:
-                if not new_tokens or new_tokens[-1] != video_token_id:
-                    new_tokens.append(video_token_id)
-            else:
-                new_tokens.append(tok)
-        # Now replace the video token with K copies
-        final_tokens = []
-        for tok in new_tokens:
-            if tok == video_token_id:
-                final_tokens.extend([video_token_id] * K)
-            else:
-                final_tokens.append(tok)
-        input_ids = torch.tensor([final_tokens], dtype=torch.long, device=device)
+    placeholder = f"{vision_start}{video_token}{vision_end}"
+    if placeholder in text:
+        text = text.replace(placeholder, compact_video_text, 1)
+    elif video_token in text:
+        text = text.replace(video_token, compact_video_text, 1)
     else:
-        input_ids = input_ids_full.to(device)
+        text = compact_video_text + text
 
-    attention_mask = torch.ones_like(input_ids, device=device)
-    inputs_embeds = model.get_input_embeddings()(input_ids)
-
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
+    tokenized = processor.tokenizer(text, return_tensors="pt")
+    input_ids = tokenized["input_ids"].to(device)
+    attention_mask = tokenized.get("attention_mask", torch.ones_like(input_ids)).to(device)
+    num_video_placeholders = int((input_ids[0] == video_token_id).sum().item())
+    if num_video_placeholders != K:
+        raise RuntimeError(
+            f"Compact prompt/video token mismatch: prompt has {num_video_placeholders} video tokens, compact memory has {K}"
+        )
 
     t_gen0 = time.perf_counter()
 
@@ -475,9 +493,9 @@ def generate_with_compact_memory(
         generated_ids = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
             compact_video_embeds=compact_embeds,
             compact_video_position_ids=compact_positions,
+            use_predictmem=False,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             temperature=None,
@@ -485,7 +503,8 @@ def generate_with_compact_memory(
         )
 
     t_gen1 = time.perf_counter()
-    total_latency = t_gen1 - t_gen0
+    generation_latency = t_gen1 - t_gen0
+    total_latency = t_compact + generation_latency
     peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024) if device == "cuda" else 0.0
 
     input_len = input_ids.shape[1]
@@ -498,9 +517,13 @@ def generate_with_compact_memory(
     stats = {
         "total_latency_s": round(total_latency, 4),
         "compact_build_latency_s": round(t_compact, 4),
+        "generation_latency_s": round(generation_latency, 4),
         "peak_memory_mb": round(peak_memory, 1),
+        "compact_build_peak_memory_mb": round(compact_peak_memory, 1),
         "fps": fps,
-        "num_frames": cm_stats.get("num_tubelets", 0) * 2,
+        "num_frames": cm_stats.get("num_frames", cm_stats.get("num_tubelets", 0) * 2),
+        "video_grid_thw": [cm_stats.get("qwen_grid_thw", [])],
+        "expected_video_tokens": cm_stats.get("original_video_tokens", 0),
         "compact_memory_tokens": K,
         "original_video_tokens": cm_stats.get("original_video_tokens", 0),
         "kept_video_tokens": cm_stats.get("kept_video_tokens", 0),
@@ -513,6 +536,10 @@ def generate_with_compact_memory(
         "full_keep_tail_tubelets": cm_stats.get("full_keep_tail_tubelets", []),
         "predictmem_stats": cm_stats,
     }
+
+    pm = getattr(getattr(model, "model", None), "predictmem", None)
+    if pm is not None:
+        setattr(getattr(model, "model"), "predictmem_last_stats", cm_stats)
 
     return response, stats
 

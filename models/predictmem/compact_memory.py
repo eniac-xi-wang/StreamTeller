@@ -4,7 +4,7 @@ Replaces the "full video → full visual tower → full inputs_embeds → prune"
 pipeline with a streaming approach:
 
 1. Stream frames tubelet-by-tubelet (never load entire video at once).
-2. Maintain a V-JEPA ring buffer (max 16 frames of 256×256).
+2. Maintain a V-JEPA ring buffer (max 16 aspect-preserving resized frames).
 3. Score each tubelet via V-JEPA, get per-patch keep mask.
 4. Call Qwen visual tower ONLY on the current tubelet/chunk.
 5. Immediately apply keep mask, append pruned embeddings to compact memory.
@@ -48,7 +48,7 @@ class PredictMemCompactMemory:
         self.compact_positions: list[torch.Tensor] = []
         self.compact_meta: list[dict] = []
 
-        self._jepa_buffer_frames: list[torch.Tensor] = []  # each [3, 256, 256] on CPU
+        self._jepa_buffer_frames: list[torch.Tensor] = []  # each [3, jepa_h, jepa_w] on CPU
         self._jepa_buffer_frame_ids: list[int] = []
         self._max_buffer = config.window_frames  # 16
 
@@ -65,6 +65,22 @@ class PredictMemCompactMemory:
         self._num_tubelets_scored = 0
         self._scored_tubelets: list[int] = []
 
+    def _reset(self) -> None:
+        self.compact_embeds.clear()
+        self.compact_positions.clear()
+        self.compact_meta.clear()
+        self._jepa_buffer_frames.clear()
+        self._jepa_buffer_frame_ids.clear()
+        self._tdigest = TDigest()
+        self._scorer = None
+        self._tail_buffer_embeds.clear()
+        self._tail_buffer_positions.clear()
+        self.stats = {}
+        self._total_video_tokens_full = 0
+        self._total_kept_tokens = 0
+        self._num_tubelets_scored = 0
+        self._scored_tubelets = []
+
     # ── Public API ─────────────────────────────────────────────────────────
 
     def ingest_video_streaming(
@@ -72,6 +88,7 @@ class PredictMemCompactMemory:
         video_path: str,
         fps: float = 1.0,
         frame_budget: int = 0,
+        stream_mode: str = "full",
         start_time: float = 0.0,
         end_time: float | None = None,
         keep_ratio: float | None = None,
@@ -82,30 +99,37 @@ class PredictMemCompactMemory:
         This is the main entry point. It never loads the full video into
         GPU memory at once.
         """
+        self._reset()
         ratio = keep_ratio if keep_ratio is not None else self.config.keep_ratio
-        self._ensure_scorer(device)
 
         sampler = StreamingVideoSampler(
             video_path, fps=fps,
             qwen_size=self.config.qwen_size,
             jepa_size=self.config.jepa_size,
             frame_budget=frame_budget,
+            stream_mode=stream_mode,
             start_time=start_time, end_time=end_time,
         )
         num_tubelets = sampler.num_tubelets
-        grid_h, grid_w = 16, 16
-        tokens_per_tubelet = 2 * grid_h * grid_w  # 512
-        self._total_video_tokens_full = num_tubelets * 2 * grid_h * grid_w
+        grid_h = sampler.jepa_h // self.config.patch_size
+        grid_w = sampler.jepa_w // self.config.patch_size
+        qwen_grid_h = sampler.qwen_h // self.config.patch_size
+        qwen_grid_w = sampler.qwen_w // self.config.patch_size
+        qwen_llm_h = qwen_grid_h // self.config.qwen_merge_size
+        qwen_llm_w = qwen_grid_w // self.config.qwen_merge_size
+        if (qwen_llm_h, qwen_llm_w) != (grid_h, grid_w):
+            raise ValueError(
+                "Compact JEPA/Qwen grids are not aligned: "
+                f"JEPA={(grid_h, grid_w)} QwenLLM={(qwen_llm_h, qwen_llm_w)}"
+            )
+        self._ensure_scorer(device, img_size=(sampler.jepa_h, sampler.jepa_w))
+        tokens_per_tubelet = grid_h * grid_w
+        self._total_video_tokens_full = num_tubelets * tokens_per_tubelet
 
         # Boundary sets
-        dropped_tubelets = {0}  # tubelet 0 always dropped
-        tail_tubelets = set()
-        if num_tubelets >= 2:
-            tail_tubelets = {num_tubelets - 2, num_tubelets - 1} & set(range(num_tubelets))
-
-        tail_frame_ids = set()
-        for tt in tail_tubelets:
-            tail_frame_ids.update([tt * 2, tt * 2 + 1])
+        dropped_tubelets = {0} if self.config.drop_bootstrap and num_tubelets > 0 else set()
+        tail_count = max(0, (self.config.tail_keep_frames + self.config.temporal_stride - 1) // self.config.temporal_stride)
+        tail_tubelets = set(range(max(0, num_tubelets - tail_count), num_tubelets)) if tail_count else set()
 
         t0_total = time.perf_counter()
         scoring_latency = 0.0
@@ -113,20 +137,20 @@ class PredictMemCompactMemory:
 
         for tubelet_data in sampler:
             tid = tubelet_data["tubelet_id"]
-            jepa_tensor = tubelet_data["jepa"]  # [n, 3, 256, 256]
-            qwen_frames = tubelet_data["qwen"]  # [n, 512, 512, 3] uint8
-            frame_ids = list(range(tid * 2, tid * 2 + jepa_tensor.shape[0]))
-
-            is_tail = any(fid in tail_frame_ids for fid in frame_ids)
+            jepa_tensor = tubelet_data["jepa"]  # [n, 3, jepa_h, jepa_w]
+            qwen_frames = tubelet_data["qwen"]  # [n, qwen_h, qwen_w, 3] uint8
+            frame_ids = list(tubelet_data["frame_indices"])
+            times_s = list(tubelet_data["times_s"])
+            tubelet_time = sum(times_s) / len(times_s) if times_s else float(tid * self.config.temporal_stride)
+            is_tail = tid in tail_tubelets
 
             if tid in dropped_tubelets:
                 # Bootstrap tubelet: drop entirely
                 self._add_to_jepa_buffer(jepa_tensor, frame_ids)
-                self._total_video_tokens_full -= tokens_per_tubelet
-                # Need embed for the placeholder count but mark for drop
                 self.compact_meta.append({
-                    "tubelet": tid, "frames": frame_ids,
-                    "mode": "bootstrap_drop", "kept_tokens": 0,
+                    "tubelet": tid, "frames": frame_ids, "times_s": times_s,
+                    "timestamp_s": tubelet_time, "mode": "bootstrap_drop",
+                    "kept_tokens": 0, "original_tokens": tokens_per_tubelet,
                 })
                 continue
 
@@ -136,58 +160,59 @@ class PredictMemCompactMemory:
                 embeds, positions = self._process_qwen_chunk(qwen_frames, tid, device)
                 visual_latency += time.perf_counter() - t_vis0
 
-                self._tail_buffer_embeds.append(embeds)
-                self._tail_buffer_positions.append(positions)
+                if embeds.shape[0] != tokens_per_tubelet:
+                    raise ValueError(
+                        f"Compact tail chunk token mismatch: got {embeds.shape[0]}, expected {tokens_per_tubelet}"
+                    )
+                self.compact_embeds.append(embeds.detach().cpu())
+                self.compact_positions.append(positions.detach().cpu())
                 self._add_to_jepa_buffer(jepa_tensor, frame_ids)
 
                 num_tokens = embeds.shape[0]
                 self._total_kept_tokens += num_tokens
                 self.compact_meta.append({
-                    "tubelet": tid, "frames": frame_ids,
-                    "mode": "protected_tail_full_keep", "kept_tokens": num_tokens,
+                    "tubelet": tid, "frames": frame_ids, "times_s": times_s,
+                    "timestamp_s": tubelet_time, "mode": "protected_tail_full_keep",
+                    "kept_tokens": num_tokens, "original_tokens": tokens_per_tubelet,
                 })
+                del embeds, positions
                 continue
 
             # Middle tubelet: V-JEPA score → keep mask → Qwen visual → apply mask
             self._add_to_jepa_buffer(jepa_tensor, frame_ids)
 
-            t_sc0 = time.perf_counter()
-            keep_mask = self._score_current_tubelet(tid, ratio, grid_h, grid_w)
-            scoring_latency += time.perf_counter() - t_sc0
-
-            self._num_tubelets_scored += 1
-            self._scored_tubelets.append(tid)
+            if tid == 0:
+                keep_mask = torch.ones(grid_h, grid_w, dtype=torch.bool)
+                mode = "bootstrap_full_keep"
+            else:
+                t_sc0 = time.perf_counter()
+                keep_mask = self._score_current_tubelet(tid, ratio, grid_h, grid_w, device=device)
+                scoring_latency += time.perf_counter() - t_sc0
+                mode = "scored"
+                self._num_tubelets_scored += 1
+                self._scored_tubelets.append(tid)
 
             t_vis0 = time.perf_counter()
             embeds, positions = self._process_qwen_chunk(qwen_frames, tid, device)
             visual_latency += time.perf_counter() - t_vis0
 
-            # Apply keep mask: keep_mask is [grid_h, grid_w] per frame in tubelet
-            n_frames = embeds.shape[0] // (grid_h * grid_w)
-            kept_pieces = []
-            kept_pos_pieces = []
-            for f in range(n_frames):
-                f_mask = keep_mask[f].flatten()  # [256]
-                f_start = f * grid_h * grid_w
-                f_end = f_start + grid_h * grid_w
-                f_embeds = embeds[f_start:f_end]
-                f_pos = positions[:, f_start:f_end]
-                kept_pieces.append(f_embeds[f_mask])
-                kept_pos_pieces.append(f_pos[:, f_mask])
+            if embeds.shape[0] != tokens_per_tubelet:
+                raise ValueError(
+                    f"Compact scored chunk token mismatch: got {embeds.shape[0]}, expected {tokens_per_tubelet}"
+                )
+            keep_flat = keep_mask.flatten().to(device=embeds.device)
+            pruned_embeds = embeds[keep_flat]
+            pruned_positions = positions[:, keep_flat]
 
-            pruned_embeds = torch.cat(kept_pieces, dim=0) if kept_pieces else \
-                embeds.new_empty((0, embeds.shape[1]))
-            pruned_positions = torch.cat(kept_pos_pieces, dim=1) if kept_pos_pieces else \
-                positions.new_empty((3, 0))
-
-            self.compact_embeds.append(pruned_embeds)
-            self.compact_positions.append(pruned_positions)
+            self.compact_embeds.append(pruned_embeds.detach().cpu())
+            self.compact_positions.append(pruned_positions.detach().cpu())
 
             kept_n = pruned_embeds.shape[0]
             self._total_kept_tokens += kept_n
             self.compact_meta.append({
-                "tubelet": tid, "frames": frame_ids,
-                "mode": "scored", "kept_tokens": kept_n,
+                "tubelet": tid, "frames": frame_ids, "times_s": times_s,
+                "timestamp_s": tubelet_time, "mode": mode,
+                "kept_tokens": kept_n, "original_tokens": tokens_per_tubelet,
             })
 
             # Free intermediate tensors
@@ -195,15 +220,8 @@ class PredictMemCompactMemory:
 
         t_total = time.perf_counter() - t0_total
 
-        # Append tail buffer (full keep, always at end)
-        for emb, pos in zip(self._tail_buffer_embeds, self._tail_buffer_positions):
-            self.compact_embeds.append(emb)
-            self.compact_positions.append(pos)
-
-        self._tail_buffer_embeds.clear()
-        self._tail_buffer_positions.clear()
-
         self.stats = {
+            "compact_memory": True,
             "original_video_tokens": self._total_video_tokens_full,
             "kept_video_tokens": self._total_kept_tokens,
             "dropped_video_tokens": self._total_video_tokens_full - self._total_kept_tokens,
@@ -218,6 +236,15 @@ class PredictMemCompactMemory:
             "total_latency_s": round(t_total, 4),
             "tdigest_samples": len(self._tdigest),
             "num_tubelets": num_tubelets,
+            "num_frames": sampler.num_frames,
+            "source_resize_hw": [sampler.source_height, sampler.source_width],
+            "qwen_resize_hw": [sampler.qwen_h, sampler.qwen_w],
+            "jepa_resize_hw": [sampler.jepa_h, sampler.jepa_w],
+            "qwen_grid_thw": [num_tubelets, qwen_grid_h, qwen_grid_w],
+            "token_grid_hw": [grid_h, grid_w],
+            "tokens_per_tubelet": tokens_per_tubelet,
+            "stream_mode": stream_mode,
+            "compact_tubelets": self.compact_meta,
         }
 
     def assemble(self, device: str = "cuda") -> dict:
@@ -255,26 +282,31 @@ class PredictMemCompactMemory:
             self._jepa_buffer_frame_ids.pop(0)
 
     def _score_current_tubelet(
-        self, tubelet_id: int, keep_ratio: float, grid_h: int, grid_w: int
+        self,
+        tubelet_id: int,
+        keep_ratio: float,
+        grid_h: int,
+        grid_w: int,
+        device: str | torch.device = "cuda",
     ) -> torch.Tensor:
         """Score the last tubelet in the JEPA buffer via V-JEPA.
 
         Returns:
-            keep_mask: [2, grid_h, grid_w] bool tensor on CPU
+            keep_mask: [grid_h, grid_w] bool tensor on CPU
         """
         from .vjepa_scorer import VJEPAPredictLossScorer
 
         scorer: VJEPAPredictLossScorer = self._scorer
-        buf = torch.stack(self._jepa_buffer_frames)  # [W, 3, 256, 256]
+        buf = torch.stack(self._jepa_buffer_frames)  # [W, 3, jepa_h, jepa_w]
         wlen = buf.shape[0]
 
         if wlen < 4:
             # Not enough context — keep all
-            return torch.ones(2, grid_h, grid_w, dtype=torch.bool)
+            return torch.ones(grid_h, grid_w, dtype=torch.bool)
 
-        clip = buf.permute(1, 0, 2, 3).unsqueeze(0)  # [1, 3, W, 256, 256]
+        clip = buf.permute(1, 0, 2, 3).unsqueeze(0).to(device)  # [1, 3, W, jepa_h, jepa_w]
         loss = scorer.score_latest_tubelet_variable(clip, window_frames=wlen)
-        loss_2d = loss.squeeze(0).reshape(2, grid_h, grid_w).cpu()  # [2, grid_h, grid_w]
+        loss_2d = loss.squeeze(0).reshape(grid_h, grid_w).cpu()
 
         # Threshold: t-digest after warm-up, local quantile otherwise
         if len(self._tdigest) > 100:
@@ -287,7 +319,7 @@ class PredictMemCompactMemory:
         # Update t-digest AFTER decision
         self._tdigest.batch_update(loss_2d.flatten().tolist())
 
-        return keep  # [2, grid_h, grid_w]
+        return keep
 
     def _process_qwen_chunk(
         self, qwen_frames, tubelet_id: int, device: str = "cuda"
@@ -305,10 +337,16 @@ class PredictMemCompactMemory:
 
         return self._chunk_proc.process_tubelet(qwen_frames, tubelet_id, device)
 
-    def _ensure_scorer(self, device: str = "cuda"):
+    def _ensure_scorer(self, device: str = "cuda", img_size: tuple[int, int] | None = None):
         if self._scorer is not None:
             return
         from .vjepa_scorer import VJEPAPredictLossScorer, make_vjepa_analyzer_scorer
+
+        pm = getattr(getattr(self.model, "model", None), "predictmem", None)
+        if pm is not None and hasattr(pm, "_ensure_scorer"):
+            pm._ensure_scorer(torch.device(device), img_size=img_size)
+            self._scorer = pm._scorer
+            return
 
         checkpoint = self.config.jepa_checkpoint_path
         if not checkpoint:
@@ -316,6 +354,7 @@ class PredictMemCompactMemory:
         models = make_vjepa_analyzer_scorer(
             checkpoint_path=checkpoint,
             device=str(device),
+            img_size=img_size or self.config.jepa_size,
             vjepa_src_path=self.config.vjepa_src_path,
         )
         self._scorer = VJEPAPredictLossScorer(

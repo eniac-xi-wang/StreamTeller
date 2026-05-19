@@ -34,6 +34,7 @@ from common.qwen35_predictmem import (
     load_qwen35_processor,
     build_video_inputs_for_eval,
     generate_qwen35_response,
+    generate_with_compact_memory,
 )
 
 PROMPT_TEMPLATE = """You are an advanced video question-answering AI assistant. You have been provided with some frames from a video and a multiple-choice question related to the video. Your task is to carefully analyze the video and provide the best answer to the question, choosing from the four options provided. Respond with only the letter (A, B, C, or D) of the correct option.
@@ -175,26 +176,40 @@ def run_single(args):
             has_options = str(row.options) != "nan" and not pd.isna(row.options)
 
             try:
-                # Build video inputs with time-window clipping
-                qwen_frames, jepa_tensor, meta, _extra = build_video_inputs_for_eval(
-                    video_path, fps=args.fps, qwen_size=args.qwen_size,
-                    jepa_size=args.jepa_size,
-                    frame_budget=args.max_num_frames,
-                    start_time=start_time,
-                    end_time=timestamp_sec,
+                use_compact = args.method == "predictmem" and (
+                    args.predictmem_runtime == "compact" or getattr(args, "compact_memory", False)
                 )
+                if use_compact:
+                    response, stats = generate_with_compact_memory(
+                        model, processor, prompt, video_path,
+                        fps=args.fps, frame_budget=args.max_num_frames,
+                        start_time=start_time, end_time=timestamp_sec,
+                        predictmem_keep_ratio=args.predictmem_keep_ratio,
+                        max_new_tokens=args.max_new_tokens,
+                        disable_thinking=True,
+                        device=getattr(args, "device", "cuda"),
+                    )
+                else:
+                    # Build video inputs with time-window clipping
+                    qwen_frames, jepa_tensor, meta, _extra = build_video_inputs_for_eval(
+                        video_path, fps=args.fps, qwen_size=args.qwen_size,
+                        jepa_size=args.jepa_size,
+                        frame_budget=args.max_num_frames,
+                        start_time=start_time,
+                        end_time=timestamp_sec,
+                    )
 
-                response, stats = generate_qwen35_response(
-                    model, processor, prompt,
-                    qwen_frames=qwen_frames, video_metadata=meta,
-                    method=args.method,
-                    predictmem_runtime=args.predictmem_runtime,
-                    predictmem_frames_256=jepa_tensor if args.method == "predictmem" else None,
-                    predictmem_keep_ratio=args.predictmem_keep_ratio,
-                    fps=args.fps, max_new_tokens=args.max_new_tokens,
-                    disable_thinking=True,
-                    video_chunk_t=getattr(args, "video_chunk_t", 0),
-                )
+                    response, stats = generate_qwen35_response(
+                        model, processor, prompt,
+                        qwen_frames=qwen_frames, video_metadata=meta,
+                        method=args.method,
+                        predictmem_runtime=args.predictmem_runtime,
+                        predictmem_frames_256=jepa_tensor if args.method == "predictmem" else None,
+                        predictmem_keep_ratio=args.predictmem_keep_ratio,
+                        fps=args.fps, max_new_tokens=args.max_new_tokens,
+                        disable_thinking=True,
+                        video_chunk_t=getattr(args, "video_chunk_t", 0),
+                    )
 
                 predicted = _extract_answer(response) if has_options else response.strip()
                 correct = predicted == str(row.answer) if has_options else None
@@ -286,6 +301,8 @@ def run_multi_gpu(args):
             cmd.append("--record_keep_masks")
         if getattr(args, "compact_memory", False):
             cmd.append("--compact_memory")
+        else:
+            cmd.append("--no_compact_memory")
         if getattr(args, "video_chunk_t", 0) > 0:
             cmd += ["--video_chunk_t", str(args.video_chunk_t)]
         if args.time_window_size is not None:
@@ -335,7 +352,7 @@ def build_parser():
     p.add_argument("--vjepa_src_path", default=None, help="V-JEPA source code path")
     # Method
     p.add_argument("--method", choices=["baseline", "predictmem"], default="baseline")
-    p.add_argument("--predictmem_runtime", choices=["plugin", "none"], default="none")
+    p.add_argument("--predictmem_runtime", choices=["auto", "compact", "plugin", "none"], default="auto")
     p.add_argument("--predictmem_keep_ratio", type=float, default=0.10)
     # PredictMem / V-JEPA params
     p.add_argument("--window_frames", type=int, default=16)
@@ -356,7 +373,8 @@ def build_parser():
     p.add_argument("--torch_dtype", default="bfloat16")
     p.add_argument("--disable_thinking", action="store_true", default=True)
     p.add_argument("--record_keep_masks", action="store_true", default=False)
-    p.add_argument("--compact_memory", action="store_true", default=False)
+    p.add_argument("--compact_memory", action="store_true", default=None)
+    p.add_argument("--no_compact_memory", dest="compact_memory", action="store_false")
     p.add_argument("--video_chunk_t", type=int, default=0)
     # Multi-GPU
     p.add_argument("--multi_gpu", action="store_true")
@@ -371,6 +389,10 @@ def build_parser():
 if __name__ == "__main__":
     parser = build_parser()
     args = parser.parse_args()
+    if args.predictmem_runtime == "auto":
+        args.predictmem_runtime = "compact" if args.method == "predictmem" else "none"
+    if args.compact_memory is None:
+        args.compact_memory = args.method == "predictmem" and args.predictmem_runtime == "compact"
     if args.multi_gpu and not args.worker:
         run_multi_gpu(args)
     else:

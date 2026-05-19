@@ -26,8 +26,8 @@ from .config import PredictMemConfig
 class PredictMemScore:
     """Output of V-JEPA scoring for one window."""
 
-    loss_map: torch.Tensor  # [B, T, 16, 16]
-    keep_mask: torch.Tensor  # [B, T, 16, 16], bool
+    loss_map: torch.Tensor  # [B, T, H, W]
+    keep_mask: torch.Tensor  # [B, T, H, W], bool
     keep_indices: list[torch.Tensor]  # per-sample flat local token indices
 
 
@@ -51,9 +51,17 @@ class VJEPAPredictLossScorer:
         self.target_encoder = target_encoder
         self.predictor = predictor
         self.degraded = degraded
-        self.grid_h = 16
-        self.grid_w = 16
-        self.num_tubelet_patches = 256
+
+    def _grid_from_clip(self, clip: torch.Tensor) -> tuple[int, int, int]:
+        patch_size = self.config.patch_size
+        height, width = int(clip.shape[-2]), int(clip.shape[-1])
+        if height % patch_size != 0 or width % patch_size != 0:
+            raise ValueError(
+                f"V-JEPA input size must be divisible by patch_size={patch_size}, "
+                f"got {(height, width)}"
+            )
+        grid_h, grid_w = height // patch_size, width // patch_size
+        return grid_h, grid_w, grid_h * grid_w
 
     # ── Analyzer-compatible: score latest tubelet, variable window length ──
 
@@ -71,23 +79,24 @@ class VJEPAPredictLossScorer:
           - Predictor: context → target
 
         Args:
-            clip: [B, 3, window_frames, 256, 256]  ImageNet-normalized
+            clip: [B, 3, window_frames, H, W]  ImageNet-normalized
             window_frames: number of frames (4, 6, ..., 16 for expanding;
                           16 for standard sliding)
 
         Returns:
-            loss: [B, 256] per-patch L1 prediction loss for the last tubelet
+            loss: [B, H/16*W/16] per-patch L1 prediction loss for the last tubelet
         """
         B, device = clip.shape[0], clip.device
+        _grid_h, _grid_w, num_tubelet_patches = self._grid_from_clip(clip)
 
         n_temporal = window_frames // 2  # tubelet_size=2
-        total_tokens = n_temporal * self.num_tubelet_patches
-        n_context = total_tokens - self.num_tubelet_patches  # all but last tubelet
+        total_tokens = n_temporal * num_tubelet_patches
+        n_context = total_tokens - num_tubelet_patches  # all but last tubelet
 
         # Build flat context / target index masks (analyzer format)
         all_tokens = torch.arange(total_tokens, device=device)
         ctx_mask = all_tokens[:n_context]  # [N_ctx]
-        tgt_mask = all_tokens[n_context:]  # [256]
+        tgt_mask = all_tokens[n_context:]  # [num_tubelet_patches]
 
         # Wrapper format: for each batch item, a list of mask variants
         # Shape: [[tensor(1, K)], ...] for B items, each with 1 variant
@@ -98,19 +107,19 @@ class VJEPAPredictLossScorer:
         # Target encoder: full input (no masks) → [tensor(1, total, D), ...]
         h_list = self.target_encoder(clips_list)
         h_target = torch.cat(
-            [h_list[b][:, -self.num_tubelet_patches:, :] for b in range(B)], dim=0
-        )  # [B, 256, D]
+            [h_list[b][:, -num_tubelet_patches:, :] for b in range(B)], dim=0
+        )  # [B, num_tubelet_patches, D]
 
         # Context encoder: masked input → [[tensor(1, N_ctx, D)], ...]
         z = self.context_encoder(clips_list, masks=masks_enc)
 
         # Predictor: context → target
         pred_out = self.predictor(z, masks_enc, masks_pred)
-        # pred_out: [[tensor(1, 256, D)], ...]
-        pred = torch.cat([pred_out[b][0] for b in range(B)], dim=0)  # [B, 256, D]
+        # pred_out: [[tensor(1, num_tubelet_patches, D)], ...]
+        pred = torch.cat([pred_out[b][0] for b in range(B)], dim=0)  # [B, num_tubelet_patches, D]
 
         # Per-patch L1 loss (mean over feature dim)
-        loss = torch.abs(pred - h_target).mean(dim=-1)  # [B, 256]
+        loss = torch.abs(pred - h_target).mean(dim=-1)  # [B, num_tubelet_patches]
 
         return loss
 
@@ -128,10 +137,11 @@ class VJEPAPredictLossScorer:
         New code should use ``score_latest_tubelet_variable``.
         """
         B, device = frames_256.shape[0], frames_256.device
-        N = self.num_tubelet_patches
+        grid_h, grid_w, N = self._grid_from_clip(frames_256)
+        n_temporal = frames_256.shape[2] // 2
         tubelet_start = target_tubelet_id * N
         tubelet_end = tubelet_start + N
-        total_tokens = 8 * N  # 16 frames → 8 tubelets
+        total_tokens = n_temporal * N
 
         ctx_indices = torch.cat([
             torch.arange(0, tubelet_start, device=device),
@@ -157,15 +167,17 @@ class VJEPAPredictLossScorer:
 
     @torch.no_grad()
     def score_window(self, frames_256: torch.Tensor) -> PredictMemScore:
-        """Score all 8 tubelets (offline mode, backward compat)."""
-        B, device = frames_256.shape[0], frames_256.device
+        """Score all tubelets in a window (offline mode, backward compat)."""
+        B = frames_256.shape[0]
+        grid_h, grid_w, _num_tubelet_patches = self._grid_from_clip(frames_256)
+        n_temporal = frames_256.shape[2] // 2
 
         all_losses = []
-        for t in range(8):
+        for t in range(n_temporal):
             loss_t = self.score_tubelet(frames_256, target_tubelet_id=t)
             all_losses.append(loss_t)
 
-        loss_map = torch.stack(all_losses, dim=1).view(B, 8, self.grid_h, self.grid_w)
+        loss_map = torch.stack(all_losses, dim=1).view(B, n_temporal, grid_h, grid_w)
         keep_mask, keep_indices = self._loss_to_keep_mask(loss_map)
 
         return PredictMemScore(
@@ -183,14 +195,16 @@ class VJEPAPredictLossScorer:
     ) -> PredictMemScore:
         """Online single-tubelet scoring (backward compat)."""
         B, device = frames_256.shape[0], frames_256.device
+        grid_h, grid_w, num_tubelet_patches = self._grid_from_clip(frames_256)
+        n_temporal = frames_256.shape[2] // 2
 
         loss_new = self.score_tubelet(frames_256, target_tubelet_id=new_tubelet_id)
 
-        loss_map = torch.zeros(B, 8, self.grid_h, self.grid_w, device=device)
-        loss_map[:, new_tubelet_id, :, :] = loss_new.view(B, self.grid_h, self.grid_w)
+        loss_map = torch.zeros(B, n_temporal, grid_h, grid_w, device=device)
+        loss_map[:, new_tubelet_id, :, :] = loss_new.view(B, grid_h, grid_w)
 
-        num_keep_per_tubelet = max(1, int(self.num_tubelet_patches * self.config.keep_ratio))
-        keep_mask = torch.zeros(B, 8, self.grid_h, self.grid_w, dtype=torch.bool, device=device)
+        num_keep_per_tubelet = max(1, int(num_tubelet_patches * self.config.keep_ratio))
+        keep_mask = torch.zeros(B, n_temporal, grid_h, grid_w, dtype=torch.bool, device=device)
         keep_indices = []
 
         if history_keep_mask is not None:
@@ -201,14 +215,14 @@ class VJEPAPredictLossScorer:
             new_loss = loss_new[b]
             if self.config.min_cell_keep:
                 keep_local = self._topk_2d_with_cell_coverage(
-                    new_loss.view(self.grid_h, self.grid_w), num_keep_per_tubelet
+                    new_loss.view(grid_h, grid_w), num_keep_per_tubelet
                 )
             else:
                 _, top = torch.topk(new_loss, num_keep_per_tubelet)
                 keep_local = top
 
-            keep_h = keep_local // self.grid_w
-            keep_w = keep_local % self.grid_w
+            keep_h = keep_local // grid_w
+            keep_w = keep_local % grid_w
             keep_mask[b, new_tubelet_id, keep_h, keep_w] = True
 
             all_kept = torch.where(keep_mask[b].flatten())[0]
@@ -223,17 +237,19 @@ class VJEPAPredictLossScorer:
     def _topk_2d_with_cell_coverage(self, loss_2d: torch.Tensor, total_keep: int) -> torch.Tensor:
         G = self.config.cell_grid_size
         H, W = loss_2d.shape
-        cells_h, cells_w = H // G, W // G
+        cells_h_count = min(G, H)
+        cells_w_count = min(G, W)
 
         cell_kept = set()
-        for ci in range(G):
-            for cj in range(G):
-                h_start, h_end = ci * cells_h, (ci + 1) * cells_h
-                w_start, w_end = cj * cells_w, (cj + 1) * cells_w
+        for ci in range(cells_h_count):
+            for cj in range(cells_w_count):
+                h_start, h_end = ci * H // cells_h_count, (ci + 1) * H // cells_h_count
+                w_start, w_end = cj * W // cells_w_count, (cj + 1) * W // cells_w_count
                 cell_loss = loss_2d[h_start:h_end, w_start:w_end]
                 best_local = cell_loss.argmax().item()
-                best_h = best_local // cells_w
-                best_w = best_local % cells_w
+                cell_w = w_end - w_start
+                best_h = best_local // cell_w
+                best_w = best_local % cell_w
                 best_global = (h_start + best_h) * W + (w_start + best_w)
                 cell_kept.add(best_global)
 
@@ -264,7 +280,7 @@ class VJEPAPredictLossScorer:
         for b in range(B):
             flat_loss = loss_map[b].flatten()
             if self.config.min_cell_keep:
-                keep_indices_b = self._topk_with_cell_coverage(flat_loss, num_keep)
+                keep_indices_b = self._topk_with_cell_coverage(flat_loss, num_keep, T, H, W)
             elif self.config.score_mode == "rank":
                 _, top_indices = torch.topk(flat_loss, num_keep)
                 keep_indices_b = top_indices
@@ -287,22 +303,30 @@ class VJEPAPredictLossScorer:
 
         return keep_mask, keep_indices
 
-    def _topk_with_cell_coverage(self, flat_loss: torch.Tensor, total_keep: int) -> torch.Tensor:
+    def _topk_with_cell_coverage(
+        self,
+        flat_loss: torch.Tensor,
+        total_keep: int,
+        T: int,
+        H: int,
+        W: int,
+    ) -> torch.Tensor:
         G = self.config.cell_grid_size
-        T = 8
-        H, W = self.grid_h, self.grid_w
-        cells_h, cells_w = H // G, W // G
+        cells_h_count = min(G, H)
+        cells_w_count = min(G, W)
+        loss_3d = flat_loss.view(T, H, W)
 
         cell_kept = set()
         for ti in range(T):
-            for ci in range(G):
-                for cj in range(G):
-                    h_start, h_end = ci * cells_h, (ci + 1) * cells_h
-                    w_start, w_end = cj * cells_w, (cj + 1) * cells_w
-                    cell_loss = flat_loss.view(T, H, W)[ti, h_start:h_end, w_start:w_end]
+            for ci in range(cells_h_count):
+                for cj in range(cells_w_count):
+                    h_start, h_end = ci * H // cells_h_count, (ci + 1) * H // cells_h_count
+                    w_start, w_end = cj * W // cells_w_count, (cj + 1) * W // cells_w_count
+                    cell_loss = loss_3d[ti, h_start:h_end, w_start:w_end]
                     best_local = cell_loss.argmax().item()
-                    best_h = best_local // cells_w
-                    best_w = best_local % cells_w
+                    cell_w = w_end - w_start
+                    best_h = best_local // cell_w
+                    best_w = best_local % cell_w
                     best_global = ti * H * W + (h_start + best_h) * W + (w_start + best_w)
                     cell_kept.add(best_global)
 
@@ -368,7 +392,7 @@ def load_vjepa_checkpoint(
 
 
 def make_vjepa_analyzer_scorer(
-    img_size: int = 256,
+    img_size: int | tuple[int, int] = 256,
     patch_size: int = 16,
     num_frames: int = 16,
     tubelet_size: int = 2,
@@ -405,8 +429,10 @@ def make_vjepa_analyzer_scorer(
     from src.models import predictor as vit_predictor
     from src.utils.wrappers import MultiSeqWrapper, PredictorMultiSeqWrapper
 
+    img_size_hw = (img_size, img_size) if isinstance(img_size, int) else tuple(img_size)
+
     encoder_kwargs = dict(
-        img_size=(img_size, img_size),
+        img_size=img_size_hw,
         patch_size=patch_size,
         num_frames=num_frames,
         tubelet_size=tubelet_size,
@@ -418,7 +444,7 @@ def make_vjepa_analyzer_scorer(
     )
 
     predictor_kwargs = dict(
-        img_size=(img_size, img_size),
+        img_size=img_size_hw,
         patch_size=patch_size,
         num_frames=num_frames,
         tubelet_size=tubelet_size,

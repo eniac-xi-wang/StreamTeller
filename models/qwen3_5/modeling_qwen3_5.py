@@ -1641,7 +1641,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         use_predictmem (`bool`, *optional*, defaults to `False`):
             Whether to prune video placeholder tokens with PredictMem during prefill.
         predictmem_frames_256 (`torch.Tensor`, *optional*):
-            [T, 3, 256, 256] float tensor for V-JEPA online scoring (plugin path).
+            [T, 3, H, W] float tensor for V-JEPA online scoring (plugin path).
             Takes priority over ``predictmem_keep_indices`` when provided.
         predictmem_keep_indices (`list[torch.LongTensor]`, *optional*):
             Per-sample Qwen video-local token indices to keep when `use_predictmem=True`.
@@ -1687,13 +1687,21 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                 # where they go. Text positions are computed from the mask.
                 full_pos = position_ids if position_ids is not None else \
                     torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) \
-                         .view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+                         .view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1).clone()
                 for b in range(inputs_embeds.shape[0]):
                     video_slots = video_mask[b].any(dim=-1)
-                    if video_slots.sum() == compact_video_position_ids.shape[1]:
-                        full_pos[:, b, video_slots] = compact_video_position_ids.to(
-                            device=full_pos.device, dtype=full_pos.dtype
+                    if video_slots.sum() != compact_video_position_ids.shape[1]:
+                        raise ValueError(
+                            "Compact video position count does not match compact video placeholders: "
+                            f"positions={compact_video_position_ids.shape[1]}, slots={int(video_slots.sum().item())}"
                         )
+                    compact_pos = compact_video_position_ids.to(
+                        device=full_pos.device, dtype=full_pos.dtype
+                    )
+                    if full_pos.shape[0] == 4:
+                        full_pos[1:, b, video_slots] = compact_pos
+                    else:
+                        full_pos[:, b, video_slots] = compact_pos
                 position_ids = full_pos
 
         elif pixel_values_videos is not None:
@@ -2165,6 +2173,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
+        past_len = past_key_values.get_seq_length() if hasattr(past_key_values, "get_seq_length") else (
+            0 if past_key_values is None else 1
+        )
+        is_prefill = is_first_iteration or past_key_values is None or past_len == 0
 
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
@@ -2181,11 +2193,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-        if not is_first_iteration and use_cache:
+        if not is_prefill and use_cache:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
             # Plugin path: clear predictmem frames on decode steps
             model_inputs["predictmem_frames_256"] = None
+            model_inputs["compact_video_embeds"] = None
+            model_inputs["compact_video_position_ids"] = None
 
         if "use_predictmem" in kwargs:
             model_inputs["use_predictmem"] = kwargs["use_predictmem"]
@@ -2197,9 +2211,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             model_inputs["predictmem_keep_ratio"] = kwargs["predictmem_keep_ratio"]
         if "video_chunk_t" in kwargs:
             model_inputs["video_chunk_t"] = kwargs["video_chunk_t"]
-        if "compact_video_embeds" in kwargs:
+        if is_prefill and "compact_video_embeds" in kwargs:
             model_inputs["compact_video_embeds"] = kwargs["compact_video_embeds"]
-        if "compact_video_position_ids" in kwargs:
+        if is_prefill and "compact_video_position_ids" in kwargs:
             model_inputs["compact_video_position_ids"] = kwargs["compact_video_position_ids"]
 
         return model_inputs
