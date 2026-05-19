@@ -6,14 +6,14 @@
   Streaming Visual Token Pruning for VLM Prefill via V-JEPA Prediction Loss
 </h3>
 
-> PredictMem uses a training-free V-JEPA prediction-loss scorer to identify and discard redundant visual tokens in streaming video, reducing LLM prefill latency and KV-cache memory for Qwen3.5-VL without any fine-tuning.
+> PredictMem uses a training-free V-JEPA prediction-loss scorer to identify and discard redundant visual tokens in streaming video, reducing LLM prefill latency and KV-cache memory for Qwen3.5 without any fine-tuning.
 
 ![Performance Comparison](assets/Performance_comparison.png)
 
 ## Highlights
 
 - **Prediction-loss gating.** V-JEPA predicts future frames; high prediction-loss patches are informative and kept, low-loss patches are redundant and dropped.
-- **Training-free & plug-and-play.** Drops into Qwen3.5-VL as an in-model plugin — no model surgery, no fine-tuning required.
+- **Training-free & plug-and-play.** Drops into Qwen3.5 as an in-model plugin — no model surgery, no fine-tuning required.
 - **Streaming scoring.** Expanding + sliding window V-JEPA scoring with online t-digest threshold estimation adapts to video content without offline pre-computation.
 - **Compact memory path.** Optional tubelet-by-tubelet streaming pipeline avoids materializing full visual embeddings, capping peak GPU memory even for very long videos.
 
@@ -33,7 +33,7 @@ StreamTeller
 │   │   ├── resize_utils.py      #   Aspect-preserving Qwen/JEPA resize
 │   │   ├── vision_inputs.py     #   Video decode + ImageNet normalize
 │   │   └── legacy/              #   Deprecated modules
-│   └── qwen3_5/                 # Qwen3.5-9B VL (local implementation)
+│   └── qwen3_5/                 # Qwen3.5-9B (local implementation)
 │       └── modeling_qwen3_5.py  #   PredictMem + compact memory integration
 ├── evaluate/                    # Evaluation framework
 │   ├── common/                  #   Shared model/video/generation helpers
