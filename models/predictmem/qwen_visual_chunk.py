@@ -9,7 +9,6 @@ the compact memory.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from typing import Tuple
 
 from .config import PredictMemConfig
@@ -32,7 +31,7 @@ class QwenVisualChunkProcessor:
     @torch.no_grad()
     def process_tubelet(
         self,
-        qwen_frames_uint8,       # [n, 512, 512, 3] uint8 numpy, n=1 or 2
+        qwen_frames_uint8,       # [n, H, W, 3] uint8 numpy, n=1 or 2
         tubelet_id: int,
         device: torch.device | str = "cuda",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -49,68 +48,61 @@ class QwenVisualChunkProcessor:
               position_ids: [3, n_tokens] — 3D M-RoPE position ids
         """
         n_frames = qwen_frames_uint8.shape[0]
-        grid_h = self.config.qwen_grid_h  # 32
-        grid_w = self.config.qwen_grid_w  # 32
-        merge = self.config.qwen_merge_size  # 2
-
-        if not hasattr(self._visual, "spatial_merge_size"):
-            raise RuntimeError("Qwen visual tower missing spatial_merge_size attribute")
-
-        # Build per-frame grid_thw for this tubelet: (n, 1, 32, 32) → (n, 32*32)
-        chunk_grid_thw = torch.tensor(
-            [[1, grid_h, grid_w] for _ in range(n_frames)],
-            dtype=torch.long, device=device,
-        )
-
-        # Build pixel_values: [n_frames * 1 * 3 * 512 * 512]
-        frames_tensor = torch.from_numpy(qwen_frames_uint8).to(device)  # [n, 512, 512, 3]
-        frames_tensor = frames_tensor.permute(0, 3, 1, 2)  # [n, 3, 512, 512]
-        # Resize to Qwen expected size if needed
-        expected_size = getattr(self._visual.config, "image_size", 512)
-        if frames_tensor.shape[-2:] != (expected_size, expected_size):
-            frames_tensor = F.interpolate(
-                frames_tensor.float(), size=(expected_size, expected_size),
-                mode="bilinear", align_corners=False
+        height, width = int(qwen_frames_uint8.shape[1]), int(qwen_frames_uint8.shape[2])
+        patch = self.config.patch_size
+        merge = self.config.qwen_merge_size
+        if height % (patch * merge) != 0 or width % (patch * merge) != 0:
+            raise ValueError(
+                "Qwen chunk size must be divisible by patch_size * merge_size, "
+                f"got {(height, width)} with patch={patch}, merge={merge}"
             )
-        pixel_values = frames_tensor.to(self._visual.dtype)  # [n, 3, H, W]
 
-        # Run visual tower on this chunk
-        vision_output = self._visual(pixel_values, grid_thw=chunk_grid_thw, return_dict=True)
-        embeds = vision_output.pooler_output  # list of tensors, one per frame
+        if not hasattr(self.processor, "video_processor"):
+            raise RuntimeError("Qwen processor missing video_processor")
 
-        # Build 3D position_ids for this chunk
-        # Each frame at temporal position (tubelet_id * 2 + frame_offset)
-        pos_ids_chunks = []
-        for f_idx in range(n_frames):
-            global_frame = tubelet_id * 2 + f_idx
-            # M-RoPE: [3, H*W/merge^2] for one frame
-            # t dimension: 1 temporal patch → pos=global_frame // 2
-            t_pos = global_frame // self.config.temporal_stride  # tubelet-level temporal id
-            hh = grid_h // merge  # 16
-            ww = grid_w // merge  # 16
-            num_tokens = hh * ww  # 256
+        video_inputs = self.processor.video_processor(
+            videos=[qwen_frames_uint8],
+            do_sample_frames=False,
+            do_resize=False,
+            return_tensors="pt",
+        )
+        pixel_values_videos = video_inputs["pixel_values_videos"].to(device)
+        video_grid_thw = video_inputs["video_grid_thw"].to(device)
 
-            # 3D position: [temporal, height, width]
-            t_ids = torch.full((num_tokens,), t_pos, dtype=torch.long, device=device)
-            h_ids = torch.arange(hh, device=device).view(-1, 1).expand(hh, ww).reshape(-1)
-            w_ids = torch.arange(ww, device=device).view(1, -1).expand(hh, ww).reshape(-1)
-            frame_pos = torch.stack([t_ids, h_ids, w_ids], dim=0)  # [3, 256]
-            pos_ids_chunks.append(frame_pos)
+        # The video processor pads a single trailing frame to temporal_patch_size=2,
+        # so every sampler item still produces one tubelet grid.
+        if int(video_grid_thw[0, 0].item()) != 1:
+            raise ValueError(f"Expected one Qwen tubelet per compact chunk, got video_grid_thw={video_grid_thw.tolist()}")
 
-        chunk_position_ids = torch.cat(pos_ids_chunks, dim=1)  # [3, n * 256]
+        vision_output = self._qwen_model.get_video_features(
+            pixel_values_videos, video_grid_thw, return_dict=True
+        )
+        embeds = vision_output.pooler_output
+        chunk_embeds = torch.cat([e.to(device) for e in embeds], dim=0) if isinstance(embeds, (list, tuple)) else embeds.to(device)
 
-        # Concatenate frame embeddings
-        if isinstance(embeds, list):
-            chunk_embeds = torch.cat([e.to(device) for e in embeds], dim=0)
-        else:
-            chunk_embeds = embeds.to(device)
+        chunk_position_ids = self._qwen_model.get_vision_position_ids(
+            start_position=0,
+            grid_thw=video_grid_thw[0],
+            temp_merge_size=1,
+            spatial_merge_size=merge,
+            device=device,
+        )
+        chunk_position_ids[0] += tubelet_id
+
+        expected_tokens = (int(video_grid_thw[0, 1].item()) // merge) * (int(video_grid_thw[0, 2].item()) // merge)
+        if chunk_embeds.shape[0] != expected_tokens or chunk_position_ids.shape[1] != expected_tokens:
+            raise ValueError(
+                "Qwen compact chunk token count mismatch: "
+                f"embeds={tuple(chunk_embeds.shape)}, positions={tuple(chunk_position_ids.shape)}, "
+                f"expected={expected_tokens}, n_frames={n_frames}, grid={video_grid_thw.tolist()}"
+            )
 
         return chunk_embeds, chunk_position_ids
 
     @torch.no_grad()
     def process_tubelet_via_processor(
         self,
-        qwen_frames_uint8,       # [n, 512, 512, 3] uint8 numpy
+        qwen_frames_uint8,       # [n, H, W, 3] uint8 numpy
         tubelet_id: int,
         global_frame_start: int,
         device: torch.device | str = "cuda",
@@ -124,38 +116,31 @@ class QwenVisualChunkProcessor:
             (embeddings, position_ids, video_grid_thw)
         """
         n_frames = qwen_frames_uint8.shape[0]
-        video_grid_thw = torch.tensor(
-            [[n_frames, self.config.qwen_grid_h, self.config.qwen_grid_w]],
-            dtype=torch.long, device=device,
-        )
-
-        # Build a minimal input: just video placeholders
-        num_video_tokens = (n_frames * self.config.qwen_grid_h * self.config.qwen_grid_w) \
-            // (self.config.qwen_merge_size ** 2)
+        height, width = int(qwen_frames_uint8.shape[1]), int(qwen_frames_uint8.shape[2])
         video_token_id = self.model.config.video_token_id
         vision_start_id = self.model.config.vision_start_token_id
         vision_end_id = self.model.config.vision_end_token_id
 
-        # Minimal input_ids: <vision_start> + video_tokens + <vision_end>
-        input_ids = torch.tensor(
-            [[vision_start_id] + [video_token_id] * num_video_tokens + [vision_end_id]],
-            dtype=torch.long, device=device,
-        )
-
         # Process
-        frames_tensor = torch.from_numpy(qwen_frames_uint8).to(device).permute(0, 3, 1, 2)
         inputs = self.processor(
             text=[""],
-            videos=[frames_tensor.cpu().numpy()],
+            videos=[qwen_frames_uint8],
             video_metadata=[{"total_num_frames": n_frames, "fps": 1.0,
                             "duration": n_frames, "frames_indices": list(range(n_frames)),
-                            "height": self.config.qwen_size, "width": self.config.qwen_size,
+                            "height": height, "width": width,
                             "video_backend": "decord"}],
             do_sample_frames=False, do_resize=False, return_tensors="pt",
         )
         # We only need the pixel_values_videos and video_grid_thw
         pixel_values_videos = inputs["pixel_values_videos"].to(device)
         video_grid_thw = inputs["video_grid_thw"].to(device)
+        num_video_tokens = int(video_grid_thw[0].prod().item()) // (self.config.qwen_merge_size ** 2)
+
+        # Minimal input_ids: <vision_start> + video_tokens + <vision_end>
+        input_ids = torch.tensor(
+            [[vision_start_id] + [video_token_id] * num_video_tokens + [vision_end_id]],
+            dtype=torch.long, device=device,
+        )
 
         vision_output = self._qwen_model.get_video_features(
             pixel_values_videos, video_grid_thw, return_dict=True

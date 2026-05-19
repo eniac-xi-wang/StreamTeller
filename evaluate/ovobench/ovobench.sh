@@ -36,14 +36,14 @@ RESULT_DIR=""
 
 # -- PredictMem / V-JEPA --
 METHOD="predictmem"                         # baseline | predictmem
-PREDICTMEM_RUNTIME=""                       # empty = auto: predictmem→plugin, baseline→none
+PREDICTMEM_RUNTIME=""                       # empty = auto: predictmem→compact, baseline→none
 PREDICTMEM_KEEP_RATIO="0.10"
 WINDOW_FRAMES=16
 STRIDE_FRAMES=2
 TAIL_KEEP_FRAMES=4
 DROP_BOOTSTRAP=true
 RECORD_KEEP_MASKS=false
-COMPACT_MEMORY=0
+COMPACT_MEMORY=""
 VIDEO_CHUNK_T=0
 
 # -- Video sampling --
@@ -94,7 +94,9 @@ while [[ $# -gt 0 ]]; do
     --drop-bootstrap) DROP_BOOTSTRAP=true; shift ;;
     --no-drop-bootstrap) DROP_BOOTSTRAP=false; shift ;;
     --record-keep-masks) RECORD_KEEP_MASKS=true; shift ;;
-    --compact-memory) COMPACT_MEMORY="$2"; shift 2 ;;
+    --compact-memory)
+      if [[ $# -gt 1 && "$2" != --* ]]; then COMPACT_MEMORY="$2"; shift 2; else COMPACT_MEMORY=1; shift; fi ;;
+    --no-compact-memory) COMPACT_MEMORY=0; shift ;;
     --video-chunk-t) VIDEO_CHUNK_T="$2"; shift 2 ;;
     --fps) FPS="$2"; shift 2 ;;
     --qwen-size) QWEN_SIZE="$2"; shift 2 ;;
@@ -124,9 +126,16 @@ done
 # ────────────────────────────────────────────────────────────────────────────
 if [[ -z "${PREDICTMEM_RUNTIME}" ]]; then
   if [[ "${METHOD}" == "predictmem" ]]; then
-    PREDICTMEM_RUNTIME="plugin"
+    PREDICTMEM_RUNTIME="compact"
   else
     PREDICTMEM_RUNTIME="none"
+  fi
+fi
+if [[ -z "${COMPACT_MEMORY}" ]]; then
+  if [[ "${METHOD}" == "predictmem" && "${PREDICTMEM_RUNTIME}" == "compact" ]]; then
+    COMPACT_MEMORY=1
+  else
+    COMPACT_MEMORY=0
   fi
 fi
 
@@ -159,6 +168,7 @@ echo "JEPA ckpt:    ${JEPA_CHECKPOINT}"
 echo "V-JEPA src:   ${VJEPA_SRC}"
 echo "Method:       ${METHOD}"
 echo "Pred runtime: ${PREDICTMEM_RUNTIME}"
+echo "Compact mem:  ${COMPACT_MEMORY}"
 echo "Keep ratio:   ${PREDICTMEM_KEEP_RATIO}"
 echo "Window:       ${WINDOW_FRAMES}f / stride ${STRIDE_FRAMES} / tail ${TAIL_KEEP_FRAMES}"
 echo "Drop boot:    ${DROP_BOOTSTRAP}"
@@ -246,6 +256,7 @@ ARGS=(
   --fps "${FPS}"
   --qwen_size "${QWEN_SIZE}"
   --jepa_size "${JEPA_SIZE}"
+  --stream_mode "${STREAM_MODE}"
   --max_new_tokens "${MAX_NEW_TOKENS}"
   --device "${DEVICE}"
   --torch_dtype "${TORCH_DTYPE}"
@@ -257,6 +268,8 @@ ${RECORD_KEEP_MASKS} && ARGS+=(--record_keep_masks)
 
 if [[ -n "${COMPACT_MEMORY}" ]] && [[ "${COMPACT_MEMORY}" -gt 0 ]]; then
   ARGS+=(--compact_memory)
+else
+  ARGS+=(--no_compact_memory)
 fi
 if [[ -n "${VIDEO_CHUNK_T}" ]] && [[ "${VIDEO_CHUNK_T}" -gt 0 ]]; then
   ARGS+=(--video_chunk_t "${VIDEO_CHUNK_T}")

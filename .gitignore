@@ -27,6 +27,7 @@ Thumbs.db
 # Project outputs
 test/
 results/
+eval_results/
 
 # Environment
 .env
