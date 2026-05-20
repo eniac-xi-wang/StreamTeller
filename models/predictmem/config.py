@@ -14,7 +14,7 @@ class PredictMemConfig:
     qwen_size: int = 512
     patch_size: int = 16
     qwen_merge_size: int = 2
-    keep_ratio: float = 0.5
+    keep_ratio: float = 0.5  # base keep ratio for distant history (outside recent window)
     min_cell_keep: bool = True
     cell_grid_size: int = 4
     keep_recent_full_frames: int = 0
@@ -28,7 +28,9 @@ class PredictMemConfig:
     vjepa_src_path: str | None = None
 
     # ── Boundary policy ──
-    tail_keep_frames: int = 4  # last N frames always kept
+    tail_keep_frames: int = 4  # last N frames always kept (100%)
+    recent_frames: int = 32  # frames within last recent_frames use recent_keep_ratio
+    recent_keep_ratio: float = 0.40  # keep ratio for the recent window (outside tail)
     drop_bootstrap: bool = True  # drop tubelet 0 (frames 0-1)
 
     # ── Stats / logging ──
