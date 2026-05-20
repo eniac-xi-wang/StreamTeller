@@ -41,6 +41,8 @@ PREDICTMEM_KEEP_RATIO="0.10"
 WINDOW_FRAMES=16
 STRIDE_FRAMES=2
 TAIL_KEEP_FRAMES=4
+RECENT_FRAMES=32
+RECENT_KEEP_RATIO="0.40"
 DROP_BOOTSTRAP=true
 RECORD_KEEP_MASKS=false
 COMPACT_MEMORY=""
@@ -91,6 +93,8 @@ while [[ $# -gt 0 ]]; do
     --window-frames) WINDOW_FRAMES="$2"; shift 2 ;;
     --stride-frames) STRIDE_FRAMES="$2"; shift 2 ;;
     --tail-keep-frames) TAIL_KEEP_FRAMES="$2"; shift 2 ;;
+    --recent-frames) RECENT_FRAMES="$2"; shift 2 ;;
+    --recent-keep-ratio) RECENT_KEEP_RATIO="$2"; shift 2 ;;
     --drop-bootstrap) DROP_BOOTSTRAP=true; shift ;;
     --no-drop-bootstrap) DROP_BOOTSTRAP=false; shift ;;
     --record-keep-masks) RECORD_KEEP_MASKS=true; shift ;;
@@ -171,6 +175,7 @@ echo "Pred runtime: ${PREDICTMEM_RUNTIME}"
 echo "Compact mem:  ${COMPACT_MEMORY}"
 echo "Keep ratio:   ${PREDICTMEM_KEEP_RATIO}"
 echo "Window:       ${WINDOW_FRAMES}f / stride ${STRIDE_FRAMES} / tail ${TAIL_KEEP_FRAMES}"
+echo "Recent:       ${RECENT_FRAMES}f / ratio ${RECENT_KEEP_RATIO}"
 echo "Drop boot:    ${DROP_BOOTSTRAP}"
 echo "FPS:          ${FPS}"
 echo "Qwen/JEPA:    ${QWEN_SIZE}/${JEPA_SIZE}"
@@ -203,6 +208,8 @@ cfg = {
     'window_frames': ${WINDOW_FRAMES},
     'stride_frames': ${STRIDE_FRAMES},
     'tail_keep_frames': ${TAIL_KEEP_FRAMES},
+    'recent_frames': ${RECENT_FRAMES},
+    'recent_keep_ratio': ${RECENT_KEEP_RATIO},
     'drop_bootstrap': '${DROP_BOOTSTRAP}' == 'true',
     'fps': ${FPS},
     'qwen_size': ${QWEN_SIZE},
@@ -253,6 +260,8 @@ ARGS=(
   --window_frames "${WINDOW_FRAMES}"
   --stride_frames "${STRIDE_FRAMES}"
   --tail_keep_frames "${TAIL_KEEP_FRAMES}"
+  --recent_frames "${RECENT_FRAMES}"
+  --recent_keep_ratio "${RECENT_KEEP_RATIO}"
   --fps "${FPS}"
   --qwen_size "${QWEN_SIZE}"
   --jepa_size "${JEPA_SIZE}"

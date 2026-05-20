@@ -126,10 +126,14 @@ class PredictMemCompactMemory:
         tokens_per_tubelet = grid_h * grid_w
         self._total_video_tokens_full = num_tubelets * tokens_per_tubelet
 
-        # Boundary sets
+        # Boundary sets (three-tier)
         dropped_tubelets = {0} if self.config.drop_bootstrap and num_tubelets > 0 else set()
         tail_count = max(0, (self.config.tail_keep_frames + self.config.temporal_stride - 1) // self.config.temporal_stride)
         tail_tubelets = set(range(max(0, num_tubelets - tail_count), num_tubelets)) if tail_count else set()
+        recent_count = max(0, self.config.recent_frames // self.config.temporal_stride)
+        recent_tubelets = set(
+            range(max(0, num_tubelets - recent_count), num_tubelets)
+        ) - tail_tubelets if recent_count else set()
 
         t0_total = time.perf_counter()
         scoring_latency = 0.0
@@ -150,6 +154,7 @@ class PredictMemCompactMemory:
                 self.compact_meta.append({
                     "tubelet": tid, "frames": frame_ids, "times_s": times_s,
                     "timestamp_s": tubelet_time, "mode": "bootstrap_drop",
+                    "tier": "bootstrap",
                     "kept_tokens": 0, "original_tokens": tokens_per_tubelet,
                 })
                 continue
@@ -173,6 +178,7 @@ class PredictMemCompactMemory:
                 self.compact_meta.append({
                     "tubelet": tid, "frames": frame_ids, "times_s": times_s,
                     "timestamp_s": tubelet_time, "mode": "protected_tail_full_keep",
+                    "tier": "tail",
                     "kept_tokens": num_tokens, "original_tokens": tokens_per_tubelet,
                 })
                 del embeds, positions
@@ -181,14 +187,18 @@ class PredictMemCompactMemory:
             # Middle tubelet: V-JEPA score → keep mask → Qwen visual → apply mask
             self._add_to_jepa_buffer(jepa_tensor, frame_ids)
 
+            tier = "old"  # default
             if tid == 0:
                 keep_mask = torch.ones(grid_h, grid_w, dtype=torch.bool)
                 mode = "bootstrap_full_keep"
+                tier = "bootstrap"
             else:
+                tubelet_ratio = self.config.recent_keep_ratio if tid in recent_tubelets else ratio
+                tier = "recent" if tid in recent_tubelets else "old"
                 t_sc0 = time.perf_counter()
-                keep_mask = self._score_current_tubelet(tid, ratio, grid_h, grid_w, device=device)
+                keep_mask = self._score_current_tubelet(tid, tubelet_ratio, grid_h, grid_w, device=device)
                 scoring_latency += time.perf_counter() - t_sc0
-                mode = "scored"
+                mode = f"scored_{tier}"
                 self._num_tubelets_scored += 1
                 self._scored_tubelets.append(tid)
 
@@ -212,6 +222,7 @@ class PredictMemCompactMemory:
             self.compact_meta.append({
                 "tubelet": tid, "frames": frame_ids, "times_s": times_s,
                 "timestamp_s": tubelet_time, "mode": mode,
+                "tier": tier,
                 "kept_tokens": kept_n, "original_tokens": tokens_per_tubelet,
             })
 
@@ -230,6 +241,9 @@ class PredictMemCompactMemory:
             "scored_tubelets": self._scored_tubelets,
             "full_keep_tail_tubelets": sorted(tail_tubelets),
             "num_tail_tubelets_kept_full": len(tail_tubelets),
+            "recent_tubelets": sorted(recent_tubelets),
+            "num_recent_tubelets": len(recent_tubelets),
+            "recent_keep_ratio": self.config.recent_keep_ratio,
             "predictmem_scoring_latency_s": round(scoring_latency, 4),
             "qwen_visual_latency_s": round(visual_latency, 4),
             "compact_memory_tokens": self._total_kept_tokens,

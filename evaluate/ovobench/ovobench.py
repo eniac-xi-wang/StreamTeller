@@ -169,6 +169,8 @@ def run_single(args):
         window_frames=args.window_frames,
         stride_frames=args.stride_frames,
         tail_keep_frames=args.tail_keep_frames,
+        recent_frames=args.recent_frames,
+        recent_keep_ratio=args.recent_keep_ratio,
         drop_bootstrap=args.drop_bootstrap,
         record_keep_masks=getattr(args, "record_keep_masks", False),
     )
@@ -359,6 +361,8 @@ def run_multi_gpu(args):
             "--window_frames", str(args.window_frames),
             "--stride_frames", str(args.stride_frames),
             "--tail_keep_frames", str(args.tail_keep_frames),
+            "--recent_frames", str(args.recent_frames),
+            "--recent_keep_ratio", str(args.recent_keep_ratio),
             "--device", getattr(args, "device", "cuda"),
             "--torch_dtype", getattr(args, "torch_dtype", "bfloat16"),
         ]
@@ -429,6 +433,8 @@ def build_parser():
     p.add_argument("--window_frames", type=int, default=16)
     p.add_argument("--stride_frames", type=int, default=2)
     p.add_argument("--tail_keep_frames", type=int, default=4)
+    p.add_argument("--recent_frames", type=int, default=32)
+    p.add_argument("--recent_keep_ratio", type=float, default=0.40)
     p.add_argument("--drop_bootstrap", action="store_true", default=True)
     p.add_argument("--no_drop_bootstrap", dest="drop_bootstrap", action="store_false")
     # Video sampling

@@ -1,11 +1,12 @@
 """FluxMem-like PredictMem plugin that runs inside Qwen3.5 prefill.
 
 V-JEPA scoring uses expanding windows for early frames and standard sliding
-windows thereafter. Token boundary policy:
+windows thereafter. Three-tier boundary policy:
 
   - Tubelet 0 (frames 0-1): always DROP (no historical context to score against)
-  - Last 4 frames (last 2 tubelets): always FULL KEEP (tail safety buffer)
-  - Middle tubelets: V-JEPA loss + t-digest top 10%
+  - Last ``tail_keep_frames`` (default 4): always FULL KEEP (tail safety buffer)
+  - Last ``recent_frames`` (default 32) excluding tail: V-JEPA loss + ``recent_keep_ratio`` (default 40%)
+  - Older tubelets: V-JEPA loss + ``keep_ratio`` (default 10%, distant history)
 """
 
 from __future__ import annotations
@@ -179,7 +180,13 @@ class PredictMemStreamingMemory(nn.Module):
 
         # ── Boundary sets ──
         dropped_bootstrap_tubelets = [0]  # tubelet 0 always dropped
-        tail_keep_tubelets = sorted({num_tubelets - 2, num_tubelets - 1} & set(range(num_tubelets)))
+        tail_keep_tubes = max(0, self.config.tail_keep_frames // self.config.temporal_stride)
+        tail_keep_tubelets = sorted({num_tubelets - tail_keep_tubes + i for i in range(tail_keep_tubes)} & set(range(num_tubelets)))
+        recent_tubes = max(0, self.config.recent_frames // self.config.temporal_stride)
+        recent_tubelets = sorted(
+            {num_tubelets - recent_tubes + i for i in range(recent_tubes - tail_keep_tubes)}
+            & set(range(num_tubelets)) - set(tail_keep_tubelets)
+        )
         tail_keep_frames = []
         for t in tail_keep_tubelets:
             tail_keep_frames.extend([t * 2, t * 2 + 1])
@@ -189,15 +196,27 @@ class PredictMemStreamingMemory(nn.Module):
         tubelet_keep = torch.ones(num_tubelets, grid_h, grid_w, dtype=torch.bool, device="cpu")
         tubelet_scored = torch.zeros(num_tubelets, dtype=torch.bool)
         tubelet_mode = {}  # tubelet_id -> str
+        tubelet_tier = {}  # tubelet_id -> "tail" | "recent" | "old" | "bootstrap"
 
         # Tubelet 0: drop
         tubelet_keep[0] = False
         tubelet_mode[0] = "bootstrap_drop"
+        tubelet_tier[0] = "bootstrap"
 
         # Tail tubelets: full keep (no scoring)
         for t in tail_keep_tubelets:
             tubelet_keep[t] = True
             tubelet_mode[t] = "protected_tail_full_keep"
+            tubelet_tier[t] = "tail"
+
+        # Recent tubelets: marked for higher keep ratio (exclude bootstrap/tail)
+        for t in recent_tubelets:
+            if t not in dropped_bootstrap_tubelets:
+                tubelet_tier[t] = "recent"
+        # Mark remaining unscored tubelets as "old"
+        for t in range(1, num_tubelets):
+            if t not in tubelet_tier:
+                tubelet_tier[t] = "old"
 
         # ── Score middle tubelets ──
         tdigest = TDigest()
@@ -223,13 +242,22 @@ class PredictMemStreamingMemory(nn.Module):
             tubelet_scored[tg_tubelet] = True
             total_scored += 1
 
+            # ── Per-tubelet keep ratio (three-tier) ──
+            if tg_tubelet in recent_tubelets:
+                tubelet_ratio = self.config.recent_keep_ratio
+                tier_str = "recent"
+            else:
+                tubelet_ratio = ratio
+                tier_str = "old"
+            tubelet_tier[tg_tubelet] = tier_str
+
             # ── Keep/drop decision (no peeking at current tubelet) ──
             if len(tdigest) > 100:
-                p_threshold = tdigest.percentile(100 * (1.0 - ratio))
-                mode_str = "scored_digest"
+                p_threshold = tdigest.percentile(100 * (1.0 - tubelet_ratio))
+                mode_str = f"scored_digest_{tier_str}"
             else:
-                p_threshold = float(torch.quantile(loss_2d.flatten(), 1.0 - ratio))
-                mode_str = "scored_local_quantile"
+                p_threshold = float(torch.quantile(loss_2d.flatten(), 1.0 - tubelet_ratio))
+                mode_str = f"scored_local_quantile_{tier_str}"
 
             tubelet_keep[tg_tubelet] = loss_2d >= p_threshold
             tubelet_mode[tg_tubelet] = mode_str
@@ -266,6 +294,7 @@ class PredictMemStreamingMemory(nn.Module):
             keep_masks_tubelets.append({
                 "tubelet": t,
                 "frames": frames,
+                "tier": tubelet_tier.get(t, "old" if t > 0 else "bootstrap"),
                 "mode": tubelet_mode.get(t, "bootstrap_drop" if t == 0 else "protected_tail_full_keep"),
                 "keep_mask": tubelet_keep[t].flatten().tolist(),
             })
@@ -299,6 +328,9 @@ class PredictMemStreamingMemory(nn.Module):
             "full_keep_tail_tubelets": tail_keep_tubelets,
             "full_keep_tail_frames": tail_keep_frames,
             "num_tail_tubelets_kept_full": len(tail_keep_tubelets),
+            "recent_tubelets": sorted(recent_tubelets),
+            "recent_keep_ratio": self.config.recent_keep_ratio,
+            "num_recent_tubelets": len(recent_tubelets),
             "tdigest_samples": len(tdigest),
             "window_mode": "expanding+sliding",
             "jepa_resize_hw": [jepa_h, jepa_w],

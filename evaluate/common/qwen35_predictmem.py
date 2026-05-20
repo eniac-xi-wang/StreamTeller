@@ -29,6 +29,8 @@ def load_qwen35_model(
     window_frames: int = 16,
     stride_frames: int = 2,
     tail_keep_frames: int = 4,
+    recent_frames: int = 32,
+    recent_keep_ratio: float = 0.40,
     drop_bootstrap: bool = True,
     record_keep_masks: bool = False,
 ):
@@ -62,6 +64,8 @@ def load_qwen35_model(
         pm.config.window_frames = window_frames
         pm.config.temporal_stride = stride_frames
         pm.config.tail_keep_frames = tail_keep_frames
+        pm.config.recent_frames = recent_frames
+        pm.config.recent_keep_ratio = recent_keep_ratio
         pm.config.drop_bootstrap = drop_bootstrap
         pm.config.record_keep_masks = record_keep_masks
         pm.config.__post_init__()
@@ -359,6 +363,8 @@ def generate_qwen35_response(
             pm_stats["window_frames"] = pm.config.window_frames
             pm_stats["stride_frames"] = pm.config.temporal_stride
             pm_stats["tail_keep_frames"] = pm.config.tail_keep_frames
+            pm_stats["recent_frames"] = pm.config.recent_frames
+            pm_stats["recent_keep_ratio"] = pm.config.recent_keep_ratio
             pm_stats["drop_bootstrap"] = pm.config.drop_bootstrap
 
     stats = {
