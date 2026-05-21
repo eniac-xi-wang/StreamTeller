@@ -160,6 +160,10 @@ def build_video_inputs_for_eval(
         # Take the last total_1fps frames, closest to clip_end
         # e.g. total_1fps=4, fps=1, duration=10 → [6, 7, 8, 9]
         times_s = [clip_end - (total_1fps - i) / fps for i in range(total_1fps)]
+    elif stream_mode == "uniform":
+        # Evenly space total_1fps frames across [clip_start, clip_end]
+        # e.g. total_1fps=4, duration=10 → [1.25, 3.75, 6.25, 8.75]
+        times_s = [clip_start + (i + 0.5) * clip_duration / total_1fps for i in range(total_1fps)]
     else:
         times_s = [clip_start + i / fps for i in range(total_1fps)]
     source_indices = [
