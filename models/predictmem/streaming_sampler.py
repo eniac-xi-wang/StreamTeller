@@ -82,6 +82,8 @@ class StreamingVideoSampler:
 
         if stream_mode == "recent":
             self.times_s = [clip_end - (total_1fps - i) / fps for i in range(total_1fps)]
+        elif stream_mode == "uniform":
+            self.times_s = [clip_start + (i + 0.5) * clip_duration / total_1fps for i in range(total_1fps)]
         else:
             self.times_s = [clip_start + i / fps for i in range(total_1fps)]
         self.source_indices = [
