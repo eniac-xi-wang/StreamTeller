@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from .resize_utils import compute_aligned_resize
+from .video_metadata import source_video_metadata
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -81,15 +82,16 @@ class StreamingVideoSampler:
             total_1fps = min(frame_budget, total_1fps)
 
         if stream_mode == "recent":
-            self.times_s = [clip_end - (total_1fps - i) / fps for i in range(total_1fps)]
+            sample_times = [clip_end - (total_1fps - i) / fps for i in range(total_1fps)]
         elif stream_mode == "uniform":
-            self.times_s = [clip_start + (i + 0.5) * clip_duration / total_1fps for i in range(total_1fps)]
+            sample_times = [clip_start + (i + 0.5) * clip_duration / total_1fps for i in range(total_1fps)]
         else:
-            self.times_s = [clip_start + i / fps for i in range(total_1fps)]
+            sample_times = [clip_start + i / fps for i in range(total_1fps)]
         self.source_indices = [
             min(total_frames - 1, max(0, int(round(t * source_fps))))
-            for t in self.times_s
+            for t in sample_times
         ]
+        self.times_s = [index / source_fps for index in self.source_indices]
         self.num_frames = total_1fps
         self.num_tubelets = (total_1fps + 1) // 2
         self.clip_start = clip_start
@@ -155,15 +157,9 @@ class StreamingVideoSampler:
 
     @property
     def metadata(self) -> dict:
-        return {
-            "total_num_frames": self.num_frames,
-            "fps": float(self.fps),
-            "duration": self.clip_end - self.clip_start,
-            "frames_indices": self.source_indices,
-            "height": self.qwen_h,
-            "width": self.qwen_w,
-            "video_backend": "decord",
-        }
+        return source_video_metadata(
+            self.source_indices, self.source_fps, len(self.vr), self.qwen_h, self.qwen_w
+        )
 
     @property
     def extra_meta(self) -> dict:

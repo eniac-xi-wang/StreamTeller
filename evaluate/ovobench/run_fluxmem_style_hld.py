@@ -47,6 +47,7 @@ def fluxmem_style_sample(video_path: str, fps: float = 1.0,
     """
     import decord
     from models.predictmem.resize_utils import smart_resize_keep_aspect
+    from models.predictmem.video_metadata import source_video_metadata
 
     decord.bridge.set_bridge("torch")
     vr = decord.VideoReader(str(video_path))
@@ -90,15 +91,7 @@ def fluxmem_style_sample(video_path: str, fps: float = 1.0,
     qwen_chw = qwen_chw.clamp(0, 255)
     qwen_uint8 = qwen_chw.round().to(torch.uint8).permute(0, 2, 3, 1).contiguous().cpu().numpy()
 
-    meta = {
-        "total_num_frames": nframes,
-        "fps": float(fps),
-        "duration": duration,
-        "frames_indices": indices,
-        "height": qwen_h,
-        "width": qwen_w,
-        "video_backend": "decord",
-    }
+    meta = source_video_metadata(indices, source_fps, total_frames, qwen_h, qwen_w)
 
     return qwen_uint8, meta, nframes
 

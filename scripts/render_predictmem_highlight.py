@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate highlight MP4 video from PredictMem keep/drop masks.
 
-Reads a PredictMem plugin JSONL result entry (or standalone keepmask JSON)
+Reads a PredictMem JSONL result entry (or standalone keepmask JSON)
 and renders a video where:
   - kept patches: original brightness
   - dropped patches: darkened to 30%
@@ -10,7 +10,7 @@ and renders a video where:
 
 Usage:
     python scripts/render_predictmem_highlight.py \
-        --jsonl results/predictmem_plugin_10.jsonl \
+        --jsonl results/predictmem_compact_10.jsonl \
         --sample 0 \
         --output results/visualizations/
 """
@@ -72,9 +72,11 @@ def render_highlight_video(
     import decord as _decord
     _decord.bridge.set_bridge("torch")
     vr = _decord.VideoReader(str(video_path))
-    native_fps = vr.get_avg_fps()
-    step = max(1, int(native_fps / fps))
-    frame_indices = list(range(0, len(vr), step))[:num_frames]
+    if "source_indices" in keep_masks:
+        frame_indices = keep_masks["source_indices"][:num_frames]
+    else:
+        step = max(1, int(vr.get_avg_fps() / fps))
+        frame_indices = list(range(0, len(vr), step))[:num_frames]
     frames_raw = vr.get_batch(frame_indices)
     if hasattr(frames_raw, "asnumpy"):
         original_frames = frames_raw.asnumpy()
@@ -153,7 +155,7 @@ def render_highlight_video(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--jsonl", required=True,
-                        help="Plugin JSONL results file")
+                        help="PredictMem JSONL results file")
     parser.add_argument("--sample", type=int, default=0,
                         help="Sample index within JSONL (0-based)")
     parser.add_argument("--keepmask_json", default=None,

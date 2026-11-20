@@ -35,6 +35,7 @@ from common.qwen35_predictmem import (
     build_video_inputs_for_eval,
     generate_qwen35_response,
     generate_with_compact_memory,
+    resolve_eval_runtime,
 )
 
 # ─── Task classification ───────────────────────────────────────────────────
@@ -173,6 +174,7 @@ def run_single(args):
         recent_keep_ratio=args.recent_keep_ratio,
         drop_bootstrap=args.drop_bootstrap,
         record_keep_masks=getattr(args, "record_keep_masks", False),
+        qwen_size=args.qwen_size, jepa_size=args.jepa_size,
     )
     processor = load_qwen35_processor(args.model_path, fps=args.fps)
     logger.info(f"Model loaded: {sum(p.numel() for p in model.parameters())/1e9:.1f}B params")
@@ -202,8 +204,7 @@ def run_single(args):
                     logger.warning(f"Video not found: {video_path}")
                     continue
 
-                use_compact = args.method == "predictmem" and getattr(args, "compact_memory", False)
-                if use_compact:
+                if args.method == "predictmem":
                     response, stats = generate_with_compact_memory(
                         model, processor, prompt, video_path,
                         fps=args.fps, frame_budget=args.frame_budget,
@@ -214,7 +215,7 @@ def run_single(args):
                         device=getattr(args, "device", "cuda"),
                     )
                 else:
-                    qwen_frames, jepa_tensor, meta, _extra = build_video_inputs_for_eval(
+                    qwen_frames, _, meta, _extra = build_video_inputs_for_eval(
                         video_path, fps=args.fps, qwen_size=args.qwen_size,
                         jepa_size=args.jepa_size, frame_budget=args.frame_budget,
                         stream_mode=args.stream_mode,
@@ -223,11 +224,7 @@ def run_single(args):
 
                     response, stats = generate_qwen35_response(
                         model, processor, prompt,
-                        qwen_frames=qwen_frames, video_metadata=meta,
-                        method=args.method,
-                        predictmem_runtime=args.predictmem_runtime,
-                        predictmem_frames_256=jepa_tensor if args.method == "predictmem" else None,
-                        predictmem_keep_ratio=args.predictmem_keep_ratio,
+                        qwen_frames=qwen_frames, video_metadata=meta, device=args.device,
                         fps=args.fps, max_new_tokens=args.max_new_tokens,
                         disable_thinking=args.disable_thinking,
                         video_chunk_t=getattr(args, "video_chunk_t", 0),
@@ -260,8 +257,7 @@ def run_single(args):
                         logger.warning(f"Video not found: {video_path}")
                         continue
 
-                    use_compact = args.method == "predictmem" and getattr(args, "compact_memory", False)
-                    if use_compact:
+                    if args.method == "predictmem":
                         response, stats = generate_with_compact_memory(
                             model, processor, prompt, video_path,
                             fps=args.fps, frame_budget=args.frame_budget,
@@ -272,7 +268,7 @@ def run_single(args):
                             device=getattr(args, "device", "cuda"),
                         )
                     else:
-                        qwen_frames, jepa_tensor, meta, _extra = build_video_inputs_for_eval(
+                        qwen_frames, _, meta, _extra = build_video_inputs_for_eval(
                             video_path, fps=args.fps, qwen_size=args.qwen_size,
                             jepa_size=args.jepa_size, frame_budget=args.frame_budget,
                             stream_mode=args.stream_mode,
@@ -281,11 +277,7 @@ def run_single(args):
 
                         response, stats = generate_qwen35_response(
                             model, processor, prompt,
-                            qwen_frames=qwen_frames, video_metadata=meta,
-                            method=args.method,
-                            predictmem_runtime=args.predictmem_runtime,
-                            predictmem_frames_256=jepa_tensor if args.method == "predictmem" else None,
-                            predictmem_keep_ratio=args.predictmem_keep_ratio,
+                            qwen_frames=qwen_frames, video_metadata=meta, device=args.device,
                             fps=args.fps, max_new_tokens=args.max_new_tokens,
                             disable_thinking=args.disable_thinking,
                             video_chunk_t=getattr(args, "video_chunk_t", 0),
@@ -355,7 +347,6 @@ def run_multi_gpu(args):
             "--log_path", str(log_path),
             "--output_jsonl", str(output_jsonl),
             "--method", args.method,
-            "--predictmem_runtime", args.predictmem_runtime,
             "--predictmem_keep_ratio", str(args.predictmem_keep_ratio),
             "--max_new_tokens", str(args.max_new_tokens),
             "--window_frames", str(args.window_frames),
@@ -378,10 +369,6 @@ def run_multi_gpu(args):
             cmd.append("--disable_thinking")
         if getattr(args, "record_keep_masks", False):
             cmd.append("--record_keep_masks")
-        if getattr(args, "compact_memory", False):
-            cmd.append("--compact_memory")
-        else:
-            cmd.append("--no_compact_memory")
         if getattr(args, "video_chunk_t", 0) > 0:
             cmd += ["--video_chunk_t", str(args.video_chunk_t)]
         if args.frame_budget:
@@ -427,7 +414,7 @@ def build_parser():
     p.add_argument("--baseline_result_dir", default=None, help="Baseline result dir for speedup comparison")
     # Method
     p.add_argument("--method", choices=["baseline", "predictmem"], default="baseline")
-    p.add_argument("--predictmem_runtime", choices=["auto", "compact", "plugin", "none"], default="auto")
+    p.add_argument("--predictmem_runtime", choices=["auto", "compact", "none"], default="auto", help=argparse.SUPPRESS)
     p.add_argument("--predictmem_keep_ratio", type=float, default=0.10)
     # PredictMem / V-JEPA params
     p.add_argument("--window_frames", type=int, default=16)
@@ -470,10 +457,10 @@ def build_parser():
 if __name__ == "__main__":
     parser = build_parser()
     args = parser.parse_args()
-    if args.predictmem_runtime == "auto":
-        args.predictmem_runtime = "compact" if args.method == "predictmem" else "none"
-    if args.compact_memory is None:
-        args.compact_memory = args.method == "predictmem" and args.predictmem_runtime == "compact"
+    try:
+        args.predictmem_runtime = resolve_eval_runtime(args.method, args.predictmem_runtime, args.compact_memory)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.multi_gpu:
         run_multi_gpu(args)
     else:

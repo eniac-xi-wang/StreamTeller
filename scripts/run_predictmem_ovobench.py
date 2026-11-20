@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
-"""PredictMem plugin evaluator for OVO-Bench — FluxMem-like in-model path.
-
-This is the MAIN entry point. The plugin path runs V-JEPA scoring inside
-Qwen3.5 prefill with expanding + sliding windows. No offline cache, no
-ScoreCache, no FramePlan, no precomputed global_scores.
-
-Usage:
-    # Baseline (no pruning)
-    python scripts/run_predictmem_ovobench.py \
-        --model_path /data/model_weights_public/Qwen/Qwen3.5-9B \
-        --method baseline --stream_mode full \
-        --max_samples 1 --disable_thinking --max_new_tokens 16 \
-        --output results/baseline_sample0.jsonl --device cuda
-
-    # Plugin PredictMem
-    python scripts/run_predictmem_ovobench.py \
-        --model_path /data/model_weights_public/Qwen/Qwen3.5-9B \
-        --method predictmem --predictmem_runtime plugin --stream_mode full \
-        --predictmem_keep_ratio 0.10 --disable_thinking \
-        --max_new_tokens 16 --max_samples 1 \
-        --output results/plugin_predictmem_sample0.jsonl --device cuda
-"""
+"""Run a short OVO-Bench comparison with compact PredictMem or the baseline."""
 
 import argparse
 import json
@@ -38,8 +17,14 @@ for _path in (_repo_root, _models_dir):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from predictmem.config import PredictMemConfig
-from predictmem.vision_inputs import build_predictmem_video_inputs
+from evaluate.common.qwen35_predictmem import (
+    apply_chat_template as apply_chat_template_for_generation,
+    build_video_inputs_for_eval,
+    generate_with_compact_memory,
+    load_qwen35_model,
+    load_qwen35_processor,
+    resolve_eval_runtime,
+)
 
 
 # ─── OVO Prompt Builder ─────────────────────────────────────────────────────
@@ -174,50 +159,8 @@ def score_parsed_response(parsed: str, ground_truth_letter: str, task: str) -> i
 
 # ─── Model / Processor Loading ───────────────────────────────────────────────
 
-def load_qwen35_model(model_path: str, device: str):
-    from models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
-    return Qwen3_5ForConditionalGeneration.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16,
-        device_map="auto" if device == "cuda" else device,
-    )
-
-
-def load_qwen35_processor(model_path: str, fps: float):
-    from transformers import AutoProcessor, AutoTokenizer
-    try:
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-    except Exception:
-        from models.qwen3_5.processing_qwen3_vl import Qwen3_5Processor
-        from models.qwen3_5.video_processing_qwen3_vl import Qwen3_5VideoProcessor
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        try:
-            video_processor = Qwen3_5VideoProcessor.from_pretrained(model_path, fps=fps)
-        except Exception:
-            video_processor = Qwen3_5VideoProcessor(fps=fps)
-        processor = Qwen3_5Processor(
-            image_processor=None, tokenizer=tokenizer,
-            video_processor=video_processor,
-            chat_template=getattr(tokenizer, "chat_template", None),
-        )
-    if hasattr(processor, "video_processor"):
-        processor.video_processor.fps = fps
-        processor.video_processor.do_resize = False
-    return processor
-
-
 def move_inputs_to_device(inputs: dict, device: str) -> dict:
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-
-
-def apply_chat_template_for_generation(processor, messages, disable_thinking: bool) -> str:
-    kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if disable_thinking:
-        kwargs["enable_thinking"] = False
-    try:
-        return processor.apply_chat_template(messages, **kwargs)
-    except TypeError:
-        kwargs.pop("enable_thinking", None)
-        return processor.apply_chat_template(messages, **kwargs)
 
 
 def decode_new_tokens(processor, generated_ids: torch.Tensor, input_len: int) -> str:
@@ -248,19 +191,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--method", required=True,
-                        choices=["baseline", "random", "uniform", "predictmem"])
-    parser.add_argument("--predictmem_runtime", default=None,
-                        choices=["plugin", "legacy_offline", "none"],
-                        help="PredictMem runtime mode. Default: plugin for predictmem, none for others.")
+                        choices=["baseline", "predictmem"])
+    parser.add_argument("--predictmem_runtime", choices=["auto", "none", "compact"], default="auto")
+    parser.add_argument("--jepa_checkpoint_path", default="/data/model_weights_public/jepa/jeap_vitl_16_256.pt")
+    parser.add_argument("--vjepa_src_path", default=None)
     parser.add_argument("--bench_path", default="evaluate/ovobench/ovo_bench_new.json")
     parser.add_argument("--video_dir", default="/data/qinian_workspace/OVO-Bench/chunked_videos")
-    parser.add_argument("--output", default="results/plugin_eval.jsonl")
+    parser.add_argument("--output", default="results/ovo_eval.jsonl")
     parser.add_argument("--max_samples", type=int, default=5)
     parser.add_argument("--predictmem_keep_ratio", type=float, default=0.10)
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--qwen_size", type=int, default=512)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new_tokens", type=int, default=8)
     parser.add_argument("--stream_mode", default="full",
                         choices=["full", "tail_budget", "uniform_budget", "first_budget"],
@@ -272,159 +214,107 @@ def main():
                         choices=["normal", "black", "shuffle", "text_only"])
     args = parser.parse_args()
 
-    # Resolve runtime mode
-    if args.predictmem_runtime is None:
-        if args.method == "predictmem":
-            predictmem_runtime = "plugin"
-        else:
-            predictmem_runtime = "none"
-    else:
-        predictmem_runtime = args.predictmem_runtime
+    try:
+        predictmem_runtime = resolve_eval_runtime(args.method, args.predictmem_runtime)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.method == "predictmem" and args.visual_ablation != "normal":
+        parser.error("Frame-array ablations require --method baseline")
 
-    config = PredictMemConfig()
-    config.keep_ratio = args.predictmem_keep_ratio
-    config.fps = args.fps
-    config.qwen_size = args.qwen_size
-    config.__post_init__()
-
-    # Load model
-    print(f"Loading Qwen3.5 from {args.model_path}...")
-    model = load_qwen35_model(args.model_path, args.device)
-    model.eval()
+    model = load_qwen35_model(
+        args.model_path, device=args.device, jepa_checkpoint_path=args.jepa_checkpoint_path,
+        vjepa_src_path=args.vjepa_src_path, predictmem_keep_ratio=args.predictmem_keep_ratio,
+        qwen_size=args.qwen_size, jepa_size=args.qwen_size // 2,
+    )
     processor = load_qwen35_processor(args.model_path, args.fps)
+    stream_mode = {"tail_budget": "recent", "uniform_budget": "uniform",
+                   "first_budget": "full", "full": "full"}[args.stream_mode]
     n_params = sum(p.numel() for p in model.parameters()) / 1e9
     print(f"  Loaded: {n_params:.1f}B params, video_token_id={model.config.video_token_id}")
 
     samples = load_ovo_samples(args.bench_path, args.max_samples, args.video_dir)
     print(f"Running {len(samples)} samples, method={args.method}, "
           f"predictmem_runtime={predictmem_runtime}, stream_mode={args.stream_mode}, "
-          f"keep_ratio={config.keep_ratio}, max_new_tokens={args.max_new_tokens}")
+          f"keep_ratio={args.predictmem_keep_ratio}, max_new_tokens={args.max_new_tokens}")
 
     results = []
     for i, sample in enumerate(samples):
         sid = sample["sample_id"]
         task = sample["task"]
-        seed = args.seed + i
 
         print(f"\n[{i+1}/{len(samples)}] sample_id={sid} task={task} method={args.method}")
 
         try:
             prompt_text, task_type, gt_letter = build_ovo_prompt(sample)
 
-            # ── Video loading: always use build_predictmem_video_inputs ──
-            # Produces Qwen 512px frames (uint8) + V-JEPA 256px tensor (ImageNet normalized).
-            # For baseline/random/uniform we discard the V-JEPA tensor.
-            predictmem_frames_256 = None
-            predictmem_stats = None
-
-            qwen_frames, jepa_tensor, _ = build_predictmem_video_inputs(
-                sample["video_path"],
-                fps=config.fps,
-                qwen_size=config.qwen_size,
-                jepa_size=config.jepa_size,
-                num_frames=args.frame_budget if args.frame_budget > 0 else None,
-            )
-            num_frames_np = qwen_frames.shape[0]
-
-            if predictmem_runtime == "plugin" and args.method == "predictmem":
-                predictmem_frames_256 = jepa_tensor
-                print(f"  Plugin video: {num_frames_np} frames, "
-                      f"jepa_tensor={list(predictmem_frames_256.shape)}")
-            else:
-                print(f"  Frames: {num_frames_np}")
-
-            # ── Visual ablation ──
-            frames_for_model = qwen_frames.copy()
-            if args.visual_ablation == "black":
-                frames_for_model = np.zeros_like(frames_for_model)
-            elif args.visual_ablation == "shuffle":
-                perm = np.random.permutation(len(frames_for_model))
-                frames_for_model = frames_for_model[perm]
-
-            # ── Build messages ──
-            content_blocks = []
-            if args.visual_ablation != "text_only":
-                content_blocks.append({"type": "video", "video": frames_for_model, "fps": config.fps})
-            content_blocks.append({"type": "text", "text": prompt_text})
-            messages = [{"role": "user", "content": content_blocks}]
-
-            text = apply_chat_template_for_generation(processor, messages, args.disable_thinking)
-
-            if args.visual_ablation == "text_only":
-                inputs = processor(text=[text], return_tensors="pt")
-            else:
-                video_metadata = {
-                    "total_num_frames": num_frames_np,
-                    "fps": float(config.fps),
-                    "duration": num_frames_np / float(config.fps),
-                    "frames_indices": list(range(num_frames_np)),
-                    "height": int(frames_for_model.shape[1]),
-                    "width": int(frames_for_model.shape[2]),
-                    "video_backend": "decord",
-                }
-                inputs = processor(
-                    text=[text], videos=[frames_for_model],
-                    video_metadata=[video_metadata],
-                    do_sample_frames=False, do_resize=False, fps=config.fps,
-                    return_tensors="pt",
+            if args.method == "predictmem":
+                raw_response, stats = generate_with_compact_memory(
+                    model, processor, prompt_text, sample["video_path"], fps=args.fps,
+                    frame_budget=args.frame_budget, stream_mode=stream_mode, device=args.device,
+                    predictmem_keep_ratio=args.predictmem_keep_ratio,
+                    max_new_tokens=args.max_new_tokens, disable_thinking=args.disable_thinking,
                 )
-            inputs = move_inputs_to_device(inputs, args.device)
-
-            # ── Compute token counts ──
-            video_grid_thw = inputs["video_grid_thw"].detach().cpu()
-            grid_t = int(video_grid_thw[0, 0].item())
-            grid_h = int(video_grid_thw[0, 1].item())
-            grid_w = int(video_grid_thw[0, 2].item())
-            merge = config.qwen_merge_size
-            num_qwen_video_tokens = grid_t * (grid_h // merge) * (grid_w // merge)
-            print(f"  video_grid_thw: {video_grid_thw.tolist()} -> {num_qwen_video_tokens} Qwen video tokens")
-
-            # ── Build generate kwargs ──
-            generate_kwargs = {}
-            if args.method == "predictmem" and predictmem_runtime == "plugin":
-                generate_kwargs["use_predictmem"] = True
-                generate_kwargs["predictmem_frames_256"] = predictmem_frames_256
-                generate_kwargs["predictmem_keep_ratio"] = config.keep_ratio
-            elif args.method == "baseline":
-                generate_kwargs["use_predictmem"] = False
+                pm_stats = stats["predictmem_stats"]
+                num_frames_np = stats["num_frames"]
+                grid = stats["video_grid_thw"]
+                num_qwen_video_tokens = stats["expected_video_tokens"]
+                total_latency = stats["total_latency_s"]
+                peak_memory = stats["peak_memory_mb"]
             else:
-                # random / uniform: use legacy keep_indices path
-                generate_kwargs["use_predictmem"] = True
-                num_video_tokens = num_qwen_video_tokens
-                if args.method == "random":
-                    torch.manual_seed(seed)
-                    n_keep = max(1, int(num_video_tokens * config.keep_ratio))
-                    perm = torch.randperm(num_video_tokens)
-                    keep = [perm[:n_keep].sort().values]
-                elif args.method == "uniform":
-                    n_keep = max(1, int(num_video_tokens * config.keep_ratio))
-                    step = num_video_tokens / n_keep
-                    keep_local = torch.round(torch.arange(n_keep).float() * step).long().clamp(0, num_video_tokens - 1).unique()
-                    keep = [keep_local.sort().values]
-                generate_kwargs["predictmem_keep_indices"] = keep
-                kept = keep[0].shape[0]
-                keep_ratio_actual = kept / num_video_tokens
-                print(f"  Keep: {kept}/{num_video_tokens} ({keep_ratio_actual:.1%})")
-
-            # ── Generate ──
-            if args.device == "cuda":
-                torch.cuda.reset_peak_memory_stats()
-            t0 = time.perf_counter()
-
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs, max_new_tokens=args.max_new_tokens,
-                    do_sample=False, temperature=None, top_p=None,
-                    **generate_kwargs,
+                qwen_frames, _, video_metadata, _ = build_video_inputs_for_eval(
+                    sample["video_path"], fps=args.fps, qwen_size=args.qwen_size,
+                    jepa_size=args.qwen_size // 2, frame_budget=args.frame_budget, stream_mode=stream_mode,
                 )
+                num_frames_np = len(qwen_frames)
+                # ── Visual ablation ──
+                frames_for_model = qwen_frames.copy()
+                if args.visual_ablation == "black":
+                    frames_for_model = np.zeros_like(frames_for_model)
+                elif args.visual_ablation == "shuffle":
+                    perm = np.random.permutation(len(frames_for_model))
+                    frames_for_model = frames_for_model[perm]
 
-            t1 = time.perf_counter()
-            total_latency = t1 - t0
-            raw_response = decode_new_tokens(processor, generated_ids, inputs["input_ids"].shape[1])
-            peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024) if args.device == "cuda" else 0.0
+                # ── Build messages ──
+                content_blocks = []
+                if args.visual_ablation != "text_only":
+                    content_blocks.append({"type": "video", "video": frames_for_model, "fps": args.fps})
+                content_blocks.append({"type": "text", "text": prompt_text})
+                messages = [{"role": "user", "content": content_blocks}]
 
-            # Collect PredictMem plugin stats
-            pm_stats = getattr(getattr(model, "model", None), "predictmem_last_stats", None)
+                text = apply_chat_template_for_generation(processor, messages, args.disable_thinking)
+
+                if args.visual_ablation == "text_only":
+                    inputs = processor(text=[text], return_tensors="pt")
+                else:
+                    inputs = processor(
+                        text=[text], videos=[frames_for_model],
+                        video_metadata=[video_metadata],
+                        do_sample_frames=False, do_resize=False, fps=args.fps,
+                        return_tensors="pt",
+                    )
+                inputs = move_inputs_to_device(inputs, args.device)
+
+                # ── Compute token counts ──
+                grid = inputs["video_grid_thw"].tolist() if "video_grid_thw" in inputs else []
+                num_qwen_video_tokens = sum(t * (h // 2) * (w // 2) for t, h, w in grid)
+
+                # ── Generate ──
+                if args.device == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
+                t0 = time.perf_counter()
+
+                with torch.no_grad():
+                    generated_ids = model.generate(
+                        **inputs, max_new_tokens=args.max_new_tokens,
+                        do_sample=False, temperature=None, top_p=None,
+                    )
+
+                t1 = time.perf_counter()
+                total_latency = t1 - t0
+                raw_response = decode_new_tokens(processor, generated_ids, inputs["input_ids"].shape[1])
+                peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024) if args.device == "cuda" else 0.0
+
+                pm_stats = None
 
             # Compute derived latency fields
             vjepa_latency = pm_stats.get("predictmem_scoring_latency_s", 0.0) if pm_stats else 0.0
@@ -451,12 +341,12 @@ def main():
                 "predictmem_runtime": predictmem_runtime,
                 "stream_mode": args.stream_mode,
                 "frame_budget": args.frame_budget,
-                "fps": config.fps,
+                "fps": args.fps,
                 "num_frames": num_frames_np,
-                "qwen_size": config.qwen_size,
-                "video_grid_thw": video_grid_thw.tolist(),
+                "qwen_size": args.qwen_size,
+                "video_grid_thw": grid,
                 "expected_video_tokens": num_qwen_video_tokens,
-                "keep_ratio_target": config.keep_ratio,
+                "keep_ratio_target": args.predictmem_keep_ratio,
                 "total_latency_s": round(total_latency, 4),
                 "predictmem_scoring_latency_s": round(vjepa_latency, 4),
                 "qwen_latency_excluding_vjepa_s": round(qwen_only_latency, 4),

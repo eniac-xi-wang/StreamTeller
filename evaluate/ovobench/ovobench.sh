@@ -128,20 +128,21 @@ done
 # ────────────────────────────────────────────────────────────────────────────
 # Auto-resolve predictmem_runtime
 # ────────────────────────────────────────────────────────────────────────────
-if [[ -z "${PREDICTMEM_RUNTIME}" ]]; then
-  if [[ "${METHOD}" == "predictmem" ]]; then
-    PREDICTMEM_RUNTIME="compact"
-  else
-    PREDICTMEM_RUNTIME="none"
-  fi
+case "${METHOD}" in
+  predictmem) runtime=compact; compact=1 ;;
+  baseline) runtime=none; compact=0 ;;
+  *) echo "Unknown method: ${METHOD} (choose baseline or predictmem)" >&2; exit 2 ;;
+esac
+if [[ -n "${PREDICTMEM_RUNTIME}" && "${PREDICTMEM_RUNTIME}" != auto && "${PREDICTMEM_RUNTIME}" != "${runtime}" ]]; then
+  echo "--method ${METHOD} requires runtime ${runtime}" >&2
+  exit 2
 fi
-if [[ -z "${COMPACT_MEMORY}" ]]; then
-  if [[ "${METHOD}" == "predictmem" && "${PREDICTMEM_RUNTIME}" == "compact" ]]; then
-    COMPACT_MEMORY=1
-  else
-    COMPACT_MEMORY=0
-  fi
+if [[ -n "${COMPACT_MEMORY}" && "${COMPACT_MEMORY}" != "${compact}" ]]; then
+  echo "The compact memory flag conflicts with --method ${METHOD}" >&2
+  exit 2
 fi
+PREDICTMEM_RUNTIME="${runtime}"
+COMPACT_MEMORY="${compact}"
 
 # ────────────────────────────────────────────────────────────────────────────
 # Result directory
@@ -253,7 +254,6 @@ ARGS=(
   --video_dir "${OVO_VIDEO_DIR}"
   --result_dir "${RESULT_DIR}"
   --method "${METHOD}"
-  --predictmem_runtime "${PREDICTMEM_RUNTIME}"
   --predictmem_keep_ratio "${PREDICTMEM_KEEP_RATIO}"
   --jepa_checkpoint_path "${JEPA_CHECKPOINT}"
   --vjepa_src_path "${VJEPA_SRC}"
@@ -275,11 +275,6 @@ ${DROP_BOOTSTRAP} && ARGS+=(--drop_bootstrap) || ARGS+=(--no_drop_bootstrap)
 ${DISABLE_THINKING} && ARGS+=(--disable_thinking)
 ${RECORD_KEEP_MASKS} && ARGS+=(--record_keep_masks)
 
-if [[ -n "${COMPACT_MEMORY}" ]] && [[ "${COMPACT_MEMORY}" -gt 0 ]]; then
-  ARGS+=(--compact_memory)
-else
-  ARGS+=(--no_compact_memory)
-fi
 if [[ -n "${VIDEO_CHUNK_T}" ]] && [[ "${VIDEO_CHUNK_T}" -gt 0 ]]; then
   ARGS+=(--video_chunk_t "${VIDEO_CHUNK_T}")
 fi

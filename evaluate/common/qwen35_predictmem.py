@@ -1,11 +1,4 @@
-"""Shared Qwen3.5 + PredictMem helpers for OVO-Bench and StreamingBench.
-
-All evaluation scripts use these functions to ensure consistent:
-  - Model / processor loading with configurable PredictMem plugin config
-  - Video sampling with start/end clipping (aspect-preserving Qwen/V-JEPA resize)
-  - Generation kwargs (baseline vs PredictMem plugin)
-  - Per-sample stats extraction
-"""
+"""Shared loading, video sampling and generation for compact PredictMem and baseline."""
 
 from __future__ import annotations
 
@@ -15,6 +8,16 @@ from typing import Any
 
 import numpy as np
 import torch
+
+
+def resolve_eval_runtime(method: str, runtime: str = "auto", compact_memory: bool | None = None) -> str:
+    """Validate older, explicit runtime flags against the selected method."""
+    expected = "compact" if method == "predictmem" else "none"
+    if runtime not in ("auto", expected):
+        raise ValueError(f"--method {method} requires --predictmem_runtime {expected}")
+    if compact_memory is not None and compact_memory != (expected == "compact"):
+        raise ValueError(f"The compact memory flag conflicts with --method {method}")
+    return expected
 
 
 # ── Model / Processor Loading ──────────────────────────────────────────────
@@ -33,19 +36,17 @@ def load_qwen35_model(
     recent_keep_ratio: float = 0.40,
     drop_bootstrap: bool = True,
     record_keep_masks: bool = False,
+    qwen_size: int = 512,
+    jepa_size: int = 256,
 ):
-    """Load Qwen3.5-9B and configure the PredictMem plugin from arguments.
-
-    The plugin is initialized by Qwen3_5ForConditionalGeneration.__init__ with
-    a default config.  We update that config here so the bash entry controls
-    every setting.
-    """
+    """Load Qwen3.5 and configure its compact memory settings."""
     import sys
     _models_dir = Path(__file__).parent.parent.parent / "models"
     if str(_models_dir) not in sys.path:
         sys.path.insert(0, str(_models_dir))
 
     from models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+    from models.predictmem.config import PredictMemConfig
 
     dtype = getattr(torch, torch_dtype, torch.bfloat16)
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
@@ -55,21 +56,20 @@ def load_qwen35_model(
     )
     model.eval()
 
-    # Configure the PredictMem plugin from bash-level settings
-    pm = getattr(getattr(model, "model", None), "predictmem", None)
-    if pm is not None:
-        pm.config.jepa_checkpoint_path = jepa_checkpoint_path
-        pm.config.vjepa_src_path = vjepa_src_path
-        pm.config.keep_ratio = predictmem_keep_ratio
-        pm.config.window_frames = window_frames
-        pm.config.temporal_stride = stride_frames
-        pm.config.tail_keep_frames = tail_keep_frames
-        pm.config.recent_frames = recent_frames
-        pm.config.recent_keep_ratio = recent_keep_ratio
-        pm.config.drop_bootstrap = drop_bootstrap
-        pm.config.record_keep_masks = record_keep_masks
-        pm.config.__post_init__()
-
+    model.predictmem_config = PredictMemConfig(
+        jepa_checkpoint_path=jepa_checkpoint_path,
+        vjepa_src_path=vjepa_src_path,
+        keep_ratio=predictmem_keep_ratio,
+        window_frames=window_frames,
+        temporal_stride=stride_frames,
+        tail_keep_frames=tail_keep_frames,
+        recent_frames=recent_frames,
+        recent_keep_ratio=recent_keep_ratio,
+        drop_bootstrap=drop_bootstrap,
+        record_keep_masks=record_keep_masks,
+        qwen_size=qwen_size,
+        jepa_size=jepa_size,
+    )
     return model
 
 
@@ -139,6 +139,7 @@ def build_video_inputs_for_eval(
         sys.path.insert(0, str(_models_dir))
 
     from predictmem.resize_utils import compute_aligned_resize
+    from predictmem.video_metadata import source_video_metadata
 
     decord.bridge.set_bridge("torch")
     vr = decord.VideoReader(str(video_path))
@@ -209,16 +210,7 @@ def build_video_inputs_for_eval(
     std = torch.tensor(IMAGENET_STD, device=jepa_01.device).view(1, 3, 1, 1)
     predictmem_frames_256 = ((jepa_01 - mean) / std).contiguous().cpu()
 
-    # Processor-safe metadata (only keys Qwen's VideoMetadata expects)
-    video_metadata = {
-        "total_num_frames": total_1fps,
-        "fps": float(fps),
-        "duration": clip_duration,
-        "frames_indices": source_indices,
-        "height": qwen_h,
-        "width": qwen_w,
-        "video_backend": "decord",
-    }
+    video_metadata = source_video_metadata(source_indices, source_fps, total_frames, qwen_h, qwen_w)
 
     # Extended metadata for logging / traceability (not passed to processor)
     extra_meta = {
@@ -258,21 +250,16 @@ def generate_qwen35_response(
     video_metadata: dict | None = None,
     method: str = "baseline",
     predictmem_runtime: str = "none",
-    predictmem_frames_256: torch.Tensor | None = None,
-    predictmem_keep_ratio: float = 0.10,
+    *,
     fps: float = 1.0,
     max_new_tokens: int = 16,
     device: str = "cuda",
     disable_thinking: bool = True,
     video_chunk_t: int = 0,
-    compact_video_embeds: torch.Tensor | None = None,
-    compact_video_position_ids: torch.Tensor | None = None,
 ) -> tuple[str, dict]:
-    """Run Qwen3.5 generation for one sample.
-
-    Returns:
-        (response_text, sample_stats_dict)
-    """
+    """Generate an unpruned baseline response from pre-sampled video frames."""
+    if method != "baseline" or predictmem_runtime not in ("auto", "none"):
+        raise ValueError("For PredictMem, pass the video path to generate_with_compact_memory().")
     num_frames = qwen_frames.shape[0]
 
     if video_metadata is None:
@@ -285,13 +272,6 @@ def generate_qwen35_response(
             "width": int(qwen_frames.shape[2]),
             "video_backend": "decord",
         }
-
-    # Warn on config mismatch
-    if method == "predictmem" and predictmem_runtime == "none":
-        import logging
-        logging.getLogger(__name__).warning(
-            "method=predictmem but predictmem_runtime=none; plugin is disabled"
-        )
 
     content_blocks = [
         {"type": "video", "video": qwen_frames, "fps": fps},
@@ -319,19 +299,8 @@ def generate_qwen35_response(
         top_p=None,
     )
 
-    if method == "predictmem" and predictmem_runtime == "plugin":
-        generate_kwargs["use_predictmem"] = True
-        generate_kwargs["predictmem_frames_256"] = predictmem_frames_256
-        generate_kwargs["predictmem_keep_ratio"] = predictmem_keep_ratio
-    else:
-        generate_kwargs["use_predictmem"] = False
-
     if video_chunk_t > 0:
         generate_kwargs["video_chunk_t"] = video_chunk_t
-    if compact_video_embeds is not None:
-        generate_kwargs["compact_video_embeds"] = compact_video_embeds
-        generate_kwargs["compact_video_position_ids"] = compact_video_position_ids
-
     input_len = inputs["input_ids"].shape[1]
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -350,37 +319,21 @@ def generate_qwen35_response(
     else:
         response = processor.tokenizer.decode(output_ids, skip_special_tokens=True)
 
-    pm_stats = extract_predictmem_stats(model)
-    vjepa_latency = pm_stats.get("predictmem_scoring_latency_s", 0.0) if pm_stats else 0.0
-
     video_grid_thw = inputs["video_grid_thw"].detach().cpu()
     grid_t, grid_h, grid_w = (int(v) for v in video_grid_thw[0].tolist())
     merge = 2
     num_video_tokens = grid_t * (grid_h // merge) * (grid_w // merge)
 
-    # Attach plugin config to stats for traceability
-    if pm_stats:
-        pm = getattr(getattr(model, "model", None), "predictmem", None)
-        if pm is not None:
-            pm_stats["jepa_checkpoint_path"] = pm.config.jepa_checkpoint_path
-            pm_stats["vjepa_src_path"] = pm.config.vjepa_src_path
-            pm_stats["window_frames"] = pm.config.window_frames
-            pm_stats["stride_frames"] = pm.config.temporal_stride
-            pm_stats["tail_keep_frames"] = pm.config.tail_keep_frames
-            pm_stats["recent_frames"] = pm.config.recent_frames
-            pm_stats["recent_keep_ratio"] = pm.config.recent_keep_ratio
-            pm_stats["drop_bootstrap"] = pm.config.drop_bootstrap
-
     stats = {
         "total_latency_s": round(total_latency, 4),
-        "predictmem_scoring_latency_s": round(vjepa_latency, 4),
-        "qwen_latency_excluding_vjepa_s": round(total_latency - vjepa_latency, 4),
+        "predictmem_scoring_latency_s": 0.0,
+        "qwen_latency_excluding_vjepa_s": round(total_latency, 4),
         "peak_memory_mb": round(peak_memory, 1),
         "video_grid_thw": video_grid_thw.tolist(),
         "expected_video_tokens": num_video_tokens,
         "fps": fps,
         "num_frames": num_frames,
-        "predictmem_stats": pm_stats,
+        "predictmem_stats": None,
     }
 
     return response, stats
@@ -426,16 +379,7 @@ def generate_with_compact_memory(
     from predictmem.config import PredictMemConfig
     from predictmem.compact_memory import PredictMemCompactMemory
 
-    # Build config from model's existing plugin config
-    pm = getattr(getattr(model, "model", None), "predictmem", None)
-    if pm is not None:
-        cfg = pm.config
-    else:
-        cfg = PredictMemConfig()
-        cfg.jepa_checkpoint_path = None  # must be set via bash
-        cfg.__post_init__()
-
-    cfg.keep_ratio = predictmem_keep_ratio
+    cfg = getattr(model, "predictmem_config", None) or PredictMemConfig()
 
     # Ingest video streaming → build compact memory
     if device == "cuda":
@@ -505,7 +449,6 @@ def generate_with_compact_memory(
             attention_mask=attention_mask,
             compact_video_embeds=compact_embeds,
             compact_video_position_ids=compact_positions,
-            use_predictmem=False,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             temperature=None,
@@ -547,10 +490,7 @@ def generate_with_compact_memory(
         "predictmem_stats": cm_stats,
     }
 
-    pm = getattr(getattr(model, "model", None), "predictmem", None)
-    if pm is not None:
-        setattr(getattr(model, "model"), "predictmem_last_stats", cm_stats)
-
+    model.model.predictmem_last_stats = cm_stats
     return response, stats
 
 

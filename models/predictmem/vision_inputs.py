@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from .resize_utils import compute_aligned_resize
+from .video_metadata import source_video_metadata
 
 # ImageNet normalization (same as Survey analyzer)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -98,14 +99,6 @@ def build_predictmem_video_inputs(
     std = torch.tensor(IMAGENET_STD, device=jepa_01.device).view(1, 3, 1, 1)
     predictmem_frames_256 = ((jepa_01 - mean) / std).contiguous().cpu()
 
-    video_metadata = {
-        "total_num_frames": total_1fps,
-        "fps": float(fps),
-        "duration": total_1fps / float(fps),
-        "frames_indices": list(range(total_1fps)),
-        "height": qwen_h,
-        "width": qwen_w,
-        "video_backend": "decord",
-    }
+    video_metadata = source_video_metadata(source_indices, source_fps, total_frames, qwen_h, qwen_w)
 
     return qwen_frames_uint8, predictmem_frames_256, video_metadata

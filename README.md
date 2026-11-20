@@ -13,20 +13,18 @@
 ## Highlights
 
 - **Prediction-loss gating.** V-JEPA predicts future frames; high prediction-loss patches are informative and kept, low-loss patches are redundant and dropped.
-- **Training-free & plug-and-play.** Drops into Qwen3.5 as an in-model plugin — no model surgery, no fine-tuning required.
+- **Training-free.** PredictMem uses pretrained V-JEPA and Qwen3.5 weights.
 - **Streaming scoring.** Expanding + sliding window V-JEPA scoring with online t-digest threshold estimation adapts to video content without offline pre-computation.
-- **Compact memory path.** Optional tubelet-by-tubelet streaming pipeline avoids materializing full visual embeddings, capping peak GPU memory even for very long videos.
+- **Compact memory path.** The tubelet-by-tubelet streaming pipeline avoids materializing full visual embeddings, capping peak GPU memory even for very long videos.
 
 ## Repository Layout
 
 ```
 StreamTeller
 ├── models/
-│   ├── predictmem/              # PredictMem plugin (decoupled from Qwen)
+│   ├── predictmem/              # Compact PredictMem
 │   │   ├── config.py            #   Configuration dataclass
 │   │   ├── vjepa_scorer.py      #   V-JEPA encoder/predictor → per-patch loss
-│   │   ├── streaming_memory.py  #   In-model scoring + pruning plugin
-│   │   ├── token_pruner.py      #   Token-level mask → pruned embeddings
 │   │   ├── streaming_sampler.py #   Tubelet-by-tubelet video sampling
 │   │   ├── qwen_visual_chunk.py #   Per-chunk Qwen visual tower
 │   │   ├── compact_memory.py    #   Streaming compact memory pipeline
@@ -41,7 +39,7 @@ StreamTeller
 │   └── streamingbench/          #   StreamingBench evaluation
 ├── scripts/                     # Visualization & analysis scripts
 ├── assets/                      # README figures
-└── summary.md                   # Detailed project status & design notes
+└── summary.md                   # Historical experiment and design notes
 ```
 
 ## Installation
@@ -67,8 +65,7 @@ pip install flash-attn --no-build-isolation
 from evaluate.common.qwen35_predictmem import (
     load_qwen35_model,
     load_qwen35_processor,
-    build_video_inputs_for_eval,
-    generate_qwen35_response,
+    generate_with_compact_memory,
 )
 
 model = load_qwen35_model(
@@ -82,17 +79,9 @@ processor = load_qwen35_processor(
     "/data/model_weights_public/Qwen/Qwen3.5-9B", fps=1.0
 )
 
-qwen_frames, jepa_tensor, meta, _ = build_video_inputs_for_eval(
-    "path/to/video.mp4", fps=1.0, frame_budget=0, stream_mode="full",
-)
-
-response, stats = generate_qwen35_response(
-    model, processor, "Describe this video.",
-    qwen_frames=qwen_frames,
-    video_metadata=meta,
-    method="predictmem",
-    predictmem_runtime="plugin",
-    predictmem_frames_256=jepa_tensor,
+response, stats = generate_with_compact_memory(
+    model, processor, "Describe this video.", "path/to/video.mp4",
+    fps=1.0, frame_budget=0, stream_mode="full",
     predictmem_keep_ratio=0.10,
 )
 print(response)
@@ -107,10 +96,6 @@ print(f"Kept {stats['predictmem_stats']['kept_video_tokens']} / {stats['expected
 # Baseline — last 4 frames only
 bash evaluate/ovobench/ovobench.sh \
   --method baseline --frame-budget 4 --stream-mode recent --num-gpus 2
-
-# PredictMem plugin — full video, V-JEPA prunes to ~10%
-bash evaluate/ovobench/ovobench.sh \
-  --method predictmem --keep-ratio 0.10 --tail-keep-frames 4 --num-gpus 2
 
 # PredictMem compact — streaming pipeline, capped memory
 bash evaluate/ovobench/ovobench.sh \
@@ -131,7 +116,7 @@ Key parameters:
 
 | Parameter | Description | Default |
 |---|---|---|
-| `--method` | `baseline` or `predictmem` | `predictmem` |
+| `--method` | `baseline` for unpruned Qwen, `predictmem` for compact memory | `predictmem` |
 | `--keep-ratio` | Fraction of middle-tubelet tokens kept | `0.10` |
 | `--tail-keep-frames` | Last N frames always fully kept | `4` |
 | `--frame-budget` | Max frames to decode (0 = all) | `0` |

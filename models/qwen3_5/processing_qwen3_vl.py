@@ -259,7 +259,7 @@ class Qwen3VLProcessor(ProcessorMixin):
         if not isinstance(indices, list):
             indices = indices.tolist()
         if len(indices) % merge_size != 0:
-            indices.extend(indices[-1] for _ in range(merge_size - len(indices) % merge_size))
+            indices = indices + [indices[-1]] * (merge_size - len(indices) % merge_size)
         timestamps = [idx / video_fps for idx in indices]
         # @JJJYmmm frames are merged by self.merge_size, \
         # so we need to average the timestamps between the first/last frame within the temporal patch

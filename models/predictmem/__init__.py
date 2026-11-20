@@ -1,6 +1,4 @@
 from .config import PredictMemConfig
-from .token_pruner import TokenPruner
-from .streaming_memory import PredictMemStreamingMemory
 from .vision_inputs import build_predictmem_video_inputs
 from .vjepa_scorer import (
     VJEPAPredictLossScorer,
@@ -13,8 +11,6 @@ from .vjepa_scorer import (
 
 __all__ = [
     "PredictMemConfig",
-    "TokenPruner",
-    "PredictMemStreamingMemory",
     "build_predictmem_video_inputs",
     "VJEPAPredictLossScorer",
     "PredictMemScore",

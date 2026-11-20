@@ -139,6 +139,7 @@ class PredictMemCompactMemory:
         scoring_latency = 0.0
         visual_latency = 0.0
 
+        scored_masks = {}
         for tubelet_data in sampler:
             tid = tubelet_data["tubelet_id"]
             jepa_tensor = tubelet_data["jepa"]  # [n, 3, jepa_h, jepa_w]
@@ -210,6 +211,8 @@ class PredictMemCompactMemory:
                 raise ValueError(
                     f"Compact scored chunk token mismatch: got {embeds.shape[0]}, expected {tokens_per_tubelet}"
                 )
+            if self.config.record_keep_masks:
+                scored_masks[tid] = keep_mask.flatten().tolist()
             keep_flat = keep_mask.flatten().to(device=embeds.device)
             pruned_embeds = embeds[keep_flat]
             pruned_positions = positions[:, keep_flat]
@@ -260,6 +263,26 @@ class PredictMemCompactMemory:
             "stream_mode": stream_mode,
             "compact_tubelets": self.compact_meta,
         }
+
+        if self.config.record_keep_masks:
+            masks = []
+            for meta in self.compact_meta:
+                tid = meta["tubelet"]
+                mask = scored_masks.get(tid)
+                if mask is None:
+                    mask = [meta["kept_tokens"] > 0] * tokens_per_tubelet
+                masks.append({
+                    "tubelet": tid,
+                    "frames": list(range(2 * tid, min(2 * tid + 2, sampler.num_frames))),
+                    "mode": meta["mode"],
+                    "tier": meta["tier"],
+                    "keep_mask": mask,
+                })
+            self.stats["predictmem_keep_masks"] = {
+                "grid_h": grid_h, "grid_w": grid_w,
+                "source_indices": sampler.source_indices,
+                "tubelets": masks,
+            }
 
     def assemble(self, device: str = "cuda") -> dict:
         """Assemble compact memory into the final format.
@@ -356,10 +379,10 @@ class PredictMemCompactMemory:
             return
         from .vjepa_scorer import VJEPAPredictLossScorer, make_vjepa_analyzer_scorer
 
-        pm = getattr(getattr(self.model, "model", None), "predictmem", None)
-        if pm is not None and hasattr(pm, "_ensure_scorer"):
-            pm._ensure_scorer(torch.device(device), img_size=img_size)
-            self._scorer = pm._scorer
+        cache_key = (str(device), img_size, self.config.jepa_checkpoint_path, self.config.vjepa_src_path)
+        cached = getattr(self.model, "_compact_scorer_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            self._scorer = cached[1]
             return
 
         checkpoint = self.config.jepa_checkpoint_path
@@ -378,3 +401,4 @@ class PredictMemCompactMemory:
             models["predictor"],
             degraded=models["degraded"],
         )
+        self.model._compact_scorer_cache = (cache_key, self._scorer)

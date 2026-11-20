@@ -25,7 +25,8 @@ for _path in (_repo_root, _models_dir):
         sys.path.insert(0, str(_path))
 
 from predictmem.config import PredictMemConfig
-from predictmem.frame_plan import build_frame_plan
+from predictmem.legacy.frame_plan import build_frame_plan
+from predictmem.video_metadata import source_video_metadata
 from scripts.run_predictmem_ovobench import (
     build_ovo_prompt,
     load_qwen35_model,
@@ -124,7 +125,10 @@ def main():
     inputs = processor(
         text=[text],
         videos=[frames_np],
-        video_metadata=[video_sample.qwen_metadata()],
+        video_metadata=[source_video_metadata(
+            frame_plan.source_indices, frame_plan.source_fps,
+            round(video_duration_s * frame_plan.source_fps), *frames_np.shape[1:3],
+        )],
         do_sample_frames=False,
         do_resize=False,
         fps=config.fps,
@@ -225,7 +229,6 @@ def main():
                 do_sample=False,
                 temperature=None,
                 top_p=None,
-                use_predictmem=False,
             )
         debug["model_probe"] = {
             "prepare_records": prepare_records,

@@ -1,5 +1,7 @@
 # StreamTeller / PredictMem 项目总结
 
+> 本文记录早期 plugin 和 compact 的开发实验。当前版本保留 compact 和 baseline 对照，运行方式见 [README](README.md)。
+
 ## 项目概述
 
 **目标**：在 streaming video 场景下，用 V-JEPA prediction loss 做 Qwen3.5-VL 视觉 token 剪枝——高 loss patch 保留，低 loss patch 丢弃，降低 LLM 输入 token 数，从而减少 prefill 延迟和 KV cache 显存。
