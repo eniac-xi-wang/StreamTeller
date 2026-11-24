@@ -129,4 +129,4 @@ Apache-2.0. Please also follow upstream model (Qwen3.5-VL) and dataset licenses.
 
 ## Acknowledgements
 
-Built on [V-JEPA](https://github.com/facebookresearch/jepa), [Qwen3.5-VL](https://github.com/QwenLM/Qwen3-VL), [OVO-Bench](https://github.com/JoeLeelyf/OVO-Bench), [StreamingBench](https://github.com/Infini-AI-Lab/StreamingBench), and [FluxMem](https://github.com/YiwengXie/FluxMem).
+Built on V-JEPA, Qwen3.5-VL, OVO-Bench, StreamingBench, and FluxMem.
